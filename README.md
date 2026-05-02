@@ -1,3 +1,11 @@
+Tienes toda la razón. A veces me pongo demasiado "épico" con las descripciones y sueno a folleto de marketing corporativo. Un desarrollador real que sube un proyecto personal a GitHub suele ir mucho más al grano, explicando el problema que tenía y cómo lo ha solucionado técnicamente.
+Vamos a limpiar todo el exceso de adornos, quitar palabras como "Enterprise" o "Golden Master", y dejar un README.md profesional, claro y que parezca escrito por un ingeniero que simplemente quería automatizarse un problema tedioso.
+Aquí tienes la versión natural:
+### Descripción corta para GitHub (About)
+> Un script robusto en Python para descargar y archivar cursos completos de Moodle (eGela). Soporta descargas concurrentes, reanudación tras fallos y apagado seguro.
+> 
+### README.md
+```markdown
 # eGela Downloader & Archiver
 
 Este es un proyecto personal para automatizar la descarga y archivo de los cursos de la plataforma Moodle de la UPV/EHU (eGela). 
@@ -21,3 +29,41 @@ Necesitas tener instalado **Python 3.12+** y Google Chrome en tu equipo.
 Clona este repositorio e instala las dependencias:
 ```bash
 pip install requests selenium webdriver-manager
+
+```
+## Configuración y Uso
+ 1. **Prepara tus credenciales:**
+   El script necesita tus datos de acceso a eGela. Por seguridad, no se escriben en el código, sino que se leen como variables de entorno.
+   En Linux/macOS:
+   ```bash
+   export EGELA_USER="tu_usuario"
+   export EGELA_PASS="tu_contraseña"
+   
+   ```
+   En Windows (PowerShell):
+   ```powershell
+   $env:EGELA_USER="tu_usuario"
+   $env:EGELA_PASS="tu_contraseña"
+   
+   ```
+ 2. **Añade los cursos:**
+   Crea un archivo llamado cursos.txt en la misma carpeta que el script. Pega ahí las URLs de la página principal de los cursos que quieres descargar (una por línea).
+   ```text
+   [https://egela.ehu.eus/course/view.php?id=12345](https://egela.ehu.eus/course/view.php?id=12345)
+   [https://egela.ehu.eus/course/view.php?id=67890](https://egela.ehu.eus/course/view.php?id=67890)
+   
+   ```
+ 3. **Ejecuta el script:**
+   ```bash
+   python egela_downloader.py
+   
+   ```
+Todo el contenido se guardará por defecto en una carpeta llamada EGELA_ENTERPRISE_TIMECAPSULE en el directorio actual.
+## Notas Técnicas
+ * El script utiliza Selenium en modo *headless* porque algunos recursos de Moodle no exponen la URL de descarga directa en el HTML estático, sino que se generan de forma dinámica o mediante blobs de Javascript.
+ * Los fallos de descarga o los recursos que requieran intervención manual (como cuestionarios interactivos o enlaces a SharePoint) se registrarán en un archivo 00_PARTE_DE_INCIDENCIAS.md dentro de la carpeta de cada curso.
+## Aviso Legal
+Este script ha sido creado únicamente con fines educativos y para uso personal, facilitando la copia de seguridad offline de los apuntes propios. Por favor, haz un uso responsable, no satures los servidores de la universidad con peticiones masivas innecesarias y respeta los derechos de autor de los materiales descargados.
+```
+
+```
