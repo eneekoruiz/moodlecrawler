@@ -1,25 +1,23 @@
-# moodlecrawler -*- coding: utf-8 -*- 
-eGela Crawler — Enterprise Time Capsule (GOLDEN MASTER v12 — FORENSIC CERTIFIED) Auditoría forense pre-vuelo completada. Correcciones aplicadas en silencio. 
+# eGela Downloader & Archiver
 
-Garantías matemáticas: 
+Este es un proyecto personal para automatizar la descarga y archivo de los cursos de la plataforma Moodle de la UPV/EHU (eGela). 
 
-• Zero Data Loss:     ningún job extraído de una cola se evapora en RAM 
+Bajar apuntes archivo por archivo a final de cuatrimestre es tedioso, así que este script se encarga de recorrer la estructura del curso, clasificar los recursos y descargarlos de forma concurrente manteniendo la organización por temas. 
 
-• Kill-Window Shield: SIGTERM en workers rescata el job in-flight a disco (fsync) 
+Está diseñado para ser muy tolerante a fallos: si se te cae el internet, te quedas sin espacio en disco o cancelas la ejecución a medias, el script guarda su estado y retomará el trabajo exactamente donde lo dejó la próxima vez que lo arranques.
 
-• Atomic I/O:         os.replace + O_EXCL + fsync_dir = escritura indestructible 
+## Características
 
-• Stateless workers:  DB es el único source of truth; procesos son efímeros • Resource safety:    todos los fd, sockets y conn cerrados en finally garantizado 
+*   **Descargas concurrentes:** Utiliza `multiprocessing` para aislar el proceso de scraping (Selenium) de los procesos de descarga (`requests`), acelerando el proceso.
+*   **Tolerancia a interrupciones (Graceful Shutdown):** Puedes parar el script en cualquier momento con `Ctrl+C`. Los procesos terminarán de descargar el archivo actual, guardarán las tareas pendientes en disco y cerrarán la base de datos limpiamente para evitar corrupciones.
+*   **Deduplicación (SQLite WAL):** Mantiene un registro en SQLite de lo que ya se ha visitado y descargado (basado en hashes SHA256). Si un profesor sube el mismo PDF en dos sitios distintos, el script crea un enlace duro (hardlink) en lugar de descargarlo dos veces.
+*   **Escrituras atómicas:** Usa bloqueos POSIX y volcados a archivos temporales (`.tmp`) antes de mover el archivo final. Esto evita que te queden PDFs a medio descargar si hay un corte de luz.
+*   **Generación de Índices:** Crea automáticamente un archivo `00_INDICE_MAESTRO.md` en cada curso con enlaces locales a todo el material, ideal para navegarlo offline con Obsidian o VS Code.
 
-• No global mutable state: semaphore, events y queues son los únicos canales IPC 
+## Requisitos
 
-• Lock hygiene:       locks huérfanos limpiados en cada arranque 
+Necesitas tener instalado **Python 3.12+** y Google Chrome en tu equipo.
 
-• FD ownership:       tmp_fd cedido a fdopen antes de cualquier excepción 
-
-Uso: 
-export EGELA_USER="tu_usuario" 
-
-export EGELA_PASS="tu_contraseña" 
-
-python egela_golden_master_v12.py
+Clona este repositorio e instala las dependencias:
+```bash
+pip install requests selenium webdriver-manager
