@@ -1,5 +1,4 @@
-# moodlecrawler 
-# -*- coding: utf-8 -*- 
+# moodlecrawler -*- coding: utf-8 -*- 
 eGela Crawler — Enterprise Time Capsule (GOLDEN MASTER v12 — FORENSIC CERTIFIED) Auditoría forense pre-vuelo completada. Correcciones aplicadas en silencio. 
 
 Garantías matemáticas: 
@@ -13,5 +12,7 @@ Garantías matemáticas:
 
 Uso: 
 export EGELA_USER="tu_usuario" 
+
 export EGELA_PASS="tu_contraseña" 
+
 python egela_golden_master_v12.py
