@@ -1,11 +1,3 @@
-Tienes toda la razón. A veces me pongo demasiado "épico" con las descripciones y sueno a folleto de marketing corporativo. Un desarrollador real que sube un proyecto personal a GitHub suele ir mucho más al grano, explicando el problema que tenía y cómo lo ha solucionado técnicamente.
-Vamos a limpiar todo el exceso de adornos, quitar palabras como "Enterprise" o "Golden Master", y dejar un README.md profesional, claro y que parezca escrito por un ingeniero que simplemente quería automatizarse un problema tedioso.
-Aquí tienes la versión natural:
-### Descripción corta para GitHub (About)
-> Un script robusto en Python para descargar y archivar cursos completos de Moodle (eGela). Soporta descargas concurrentes, reanudación tras fallos y apagado seguro.
-> 
-### README.md
-```markdown
 # eGela Downloader & Archiver
 
 Este es un proyecto personal para automatizar la descarga y archivo de los cursos de la plataforma Moodle de la UPV/EHU (eGela). 
