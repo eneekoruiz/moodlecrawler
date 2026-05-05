@@ -81,7 +81,7 @@ from email.utils import decode_rfc2231
 
 import requests
 from selenium import webdriver
-from selenium.webdriver.by import By
+from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
@@ -155,6 +155,7 @@ CONFIG = {
 
 # Tamaño real de dl_q = MAX_IN_FLIGHT * 2 (backpressure bloqueante real)
 _DL_Q_MAXSIZE = CONFIG["MAX_IN_FLIGHT"] * 2
+_STOP_SENTINEL = {"type": "_STOP_SENTINEL_"}
 
 _WINDOWS_RESERVED = frozenset({
     "CON", "PRN", "AUX", "NUL",
@@ -645,10 +646,14 @@ def safe_put(q: mp.Queue, item: dict) -> bool:
     1. put_nowait — camino feliz.
     2. Espera 500ms y reintento — cubre picos transitorios.
     3. Fallback físico a disco — nunca bloquea el caller.
-    4. Log CRITICAL si el dump falla — el dato se reporta como perdido.
-
-    Retorna True si el item fue encolado; False si fue volcado a disco.
     """
+    if item is None or item == _STOP_SENTINEL:
+        try:
+            q.put(item, timeout=5)
+            return True
+        except queue.Full:
+            return False
+
     try:
         q.put_nowait(item)
         return True
@@ -666,7 +671,7 @@ def safe_put(q: mp.Queue, item: dict) -> bool:
     try:
         with open(ef, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(
-                {**item, "reason": "queue_full", "_ts": time.time()},
+                {**item, "reason": "queue_full", "_ts": time.time(), "_pid": os.getpid()},
                 ensure_ascii=False
             ) + "\n")
             fh.flush()
@@ -680,60 +685,97 @@ def safe_put(q: mp.Queue, item: dict) -> bool:
     log.error("Queue llena — volcado a disco (fsync OK): %s", item.get("type"))
     return False
 
-
-def reingest_rescued_jobs(dl_q: mp.Queue) -> int:
+class DownloadPermit:
     """
-    Reingestión automática al arranque.
-    Los archivos totalmente procesados se renombran a .bak (nunca a .jsonl)
-    para que ningún glob futuro los vuelva a capturar y reencolar.
+    RAII Context Manager para permisos de descarga.
+    Garantiza que el semáforo se libere exactamente una vez.
+    """
+    def __init__(self, semaphore, job):
+        self.sem = semaphore
+        self.job = job
+        self.acquired = False
+
+    def __enter__(self):
+        self.sem.acquire()
+        self.acquired = True
+        self.job["_sem_owned"] = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+    def release(self):
+        if self.acquired:
+            with contextlib.suppress(Exception):
+                self.sem.release()
+            self.acquired = False
+            self.job["_sem_owned"] = False
+
+def reingest_emergency_data(dl_q: mp.Queue, spider_q: mp.Queue, db_q: mp.Queue, semaphore: mp.BoundedSemaphore) -> dict:
+    """
+    Reingestión centralizada ATÓMICA.
+    Usa os.replace para garantizar que no se pierdan datos si el arranque se interrumpe.
     """
     patterns = [
         os.path.join(CONFIG["ROOT_DIR"], "_EMERGENCY_DUMP_*.jsonl"),
-        os.path.join(CONFIG["ROOT_DIR"], "_PENDING_DOWNLOADS_RESCUED.jsonl"),
+        os.path.join(CONFIG["ROOT_DIR"], "_*_RESCUED.jsonl"),
     ]
-    reingested = 0
+    counts = {"DOWNLOAD_JOB": 0, "SPIDER_TASK": 0, "DB_EVENT": 0}
+    
     for fpath in [f for pat in patterns for f in glob.glob(pat)]:
-        # Guardia extra: nunca procesar archivos ya archivados como .bak
-        if not fpath.endswith(".jsonl"):
-            continue
-        skipped = []
+        if not fpath.endswith(".jsonl"): continue
+        
+        remaining = []
         try:
             with open(fpath, "r", encoding="utf-8") as fh:
                 for line in fh:
                     try:
-                        job = json.loads(line)
-                        # DLQ, VISITED y HASH son eventos de BD, no jobs de descarga.
-                        # Si se reingertan en dl_q, el downloader los descarta
-                        # silenciosamente y se pierden los registros. (Fix grieta #4)
-                        if job.get("type") in ("DLQ", "VISITED", "HASH", None):
-                            skipped.append(line)
-                            continue
-                        job.pop("reason", None)
-                        job.pop("_ts", None)
-                        if safe_put(dl_q, job):
-                            reingested += 1
+                        item = json.loads(line)
+                        t = item.get("type")
+                        
+                        if t in ("VISITED", "HASH", "DLQ"):
+                            if safe_put(db_q, item): counts["DB_EVENT"] += 1
+                            else: remaining.append(line)
+                        elif "cid" in item and "url" in item:
+                            if "section" in item or "target" in item:
+                                if semaphore.acquire(block=False):
+                                    item["_sem_owned"] = True
+                                    if safe_put(dl_q, item): counts["DOWNLOAD_JOB"] += 1
+                                    else:
+                                        semaphore.release()
+                                        item.pop("_sem_owned", None)
+                                        remaining.append(line)
+                                else:
+                                    remaining.append(line)
+                            else:
+                                if safe_put(spider_q, item): counts["SPIDER_TASK"] += 1
+                                else: remaining.append(line)
                         else:
-                            skipped.append(line)
+                            remaining.append(line)
                     except Exception:
-                        skipped.append(line)
-        except OSError as e:
-            log.warning("Reingestión: error leyendo %s: %s", fpath, e)
+                        remaining.append(line)
+        except OSError:
             continue
 
-        # Renombrar a .bak — queda fuera de cualquier glob *.jsonl presente o futuro
-        done = fpath[:-len(".jsonl")] + f".done_{int(time.time())}.bak"
-        try:
-            if skipped:
-                with open(fpath, "w", encoding="utf-8") as fh:
-                    fh.writelines(skipped)
-            else:
-                os.rename(fpath, done)
-        except OSError:
-            pass
+        # Reemplazo atómico del fichero con el sobrante
+        if remaining:
+            tmp_f = fpath + ".tmp"
+            try:
+                with open(tmp_f, "w", encoding="utf-8") as fh:
+                    fh.writelines(remaining)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_f, fpath)
+            except OSError:
+                pass
+        else:
+            done = fpath[:-len(".jsonl")] + f".done_{int(time.time())}.bak"
+            with contextlib.suppress(OSError):
+                os.replace(fpath, done)
 
-    if reingested:
-        log.info("♻️  Reingestión: %d trabajos recuperados.", reingested)
-    return reingested
+    for k, v in counts.items():
+        if v: log.info("♻️  Reingestión %s: %d items recuperados.", k, v)
+    return counts
 
 
 def async_requeue_with_backoff(q: mp.Queue, job: dict) -> bool:
@@ -874,6 +916,8 @@ def db_daemon(q: mp.Queue, db_path: str, stop: mp.Event):
         while not stop.is_set():
             try:
                 ev = q.get(timeout=1.0)
+                if ev == _STOP_SENTINEL:
+                    break
                 _process_event(ev)
             except queue.Empty:
                 if time.monotonic() - last_event_ts > 5.0:
@@ -919,6 +963,13 @@ def _acquire_posix_lock(lock_path: str) -> tuple:
     """
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        # Escribir metadatos de propiedad (PID + Hostname + TS)
+        meta = json.dumps({
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "ts": time.time()
+        })
+        os.write(fd, meta.encode("utf-8"))
         return fd, True
     except FileExistsError:
         return -1, False
@@ -996,23 +1047,52 @@ def _atomic_replace(src: str, dst: str, expected_hash: str = ""):
             raise
 
 
+def _is_pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_INFORMATION = 0x0400
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+        if handle == 0:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
 def _cleanup_stale_locks(locks_dir: str):
     """
-    Elimina lock files huérfanos de runs anteriores (SIGKILL, OOM, crash).
-    Llamado una sola vez en main() antes de arrancar workers.
+    Elimina lock files huérfanos verificando si el proceso dueño sigue vivo.
     """
     if not _path_exists_safe(locks_dir):
         return
     cleaned = 0
+    my_host = socket.gethostname()
     for lf in glob.glob(os.path.join(locks_dir, ".lock_*")):
         try:
-            st = os.stat(lf)
-            # Si el lock tiene más de 10 minutos → huérfano seguro
-            if time.time() - st.st_mtime > 600:
+            with open(lf, "r") as f:
+                data = json.loads(f.read())
+            
+            # Solo limpiar si es de este host y el PID no existe
+            if data.get("host") == my_host:
+                pid = data.get("pid")
+                if pid and not _is_pid_alive(pid):
+                    os.remove(lf)
+                    cleaned += 1
+            elif time.time() - os.stat(lf).st_mtime > 3600:
+                # Si es de otro host, esperar 1h por si acaso
                 os.remove(lf)
                 cleaned += 1
-        except OSError:
-            pass
+        except (OSError, ValueError, json.JSONDecodeError):
+            # Si el lock está corrupto o vacío, y tiene cierta edad, limpiar
+            with contextlib.suppress(OSError):
+                if time.time() - os.stat(lf).st_mtime > 60:
+                    os.remove(lf)
+                    cleaned += 1
     if cleaned:
         log.info("🧹 %d lock(s) huérfanos eliminados.", cleaned)
 
@@ -1158,6 +1238,8 @@ def save_url_reference(
         with open(fpath, "w", encoding="utf-8") as fh:
             fh.write("[InternetShortcut]\n")
             fh.write(f"URL={url}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError:
         return ""
 
@@ -1175,6 +1257,8 @@ def save_url_reference(
     try:
         with open(fpath + ".meta.json", "w", encoding="utf-8") as fh:
             json.dump(meta, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError:
         pass
 
@@ -1263,18 +1347,18 @@ def _enqueue_download(
 ) -> bool:
     """
     Adquiere semáforo y encola. Si safe_put falla, libera semáforo.
-    Garantiza que nunca se quede un permiso adquirido sin job encolado.
     """
     if stop_workers.is_set():
         return False
-    semaphore.acquire()
-    if stop_workers.is_set():
-        semaphore.release()
+    
+    with DownloadPermit(semaphore, job) as permit:
+        if stop_workers.is_set():
+            return False
+        if safe_put(dq, job):
+            # El permiso ahora pertenece al job en la cola, no a este contexto
+            permit.acquired = False 
+            return True
         return False
-    if not safe_put(dq, job):
-        semaphore.release()
-        return False
-    return True
 
 
 def extract_page_content(
@@ -1694,6 +1778,19 @@ def _download_one(
         safe_put(dbq, {"type": "DLQ", "severity": severity,
                         "msg": msg, "url": url, "cid": cid, "action": action})
 
+    def _save_fallback_reference(reason: str, resource_type: str = "file"):
+        save_url_reference(
+            target_dir,
+            seq,
+            name,
+            url,
+            job.get("page_origin", ""),
+            resource_type,
+            reason,
+            ctx_section=job.get("section", ""),
+            ctx_label=job.get("label_context", ""),
+        )
+
     # Refresh periódico de ro_conn para evitar bloqueo de WAL checkpoint.
     # ro_conn_ref[0] se modifica in-place: el nuevo objeto es visible desde
     # downloader() sin necesidad de valor de retorno.
@@ -1743,11 +1840,22 @@ def _download_one(
 
             if "text/html" in ctype:
                 preview = r.raw.read(4096, decode_content=True)
-                if any(s in preview.lower() for s in _HTML_BAD_SIGS):
-                    _dlq("recoverable", "Wrapper HTML de login/error.",
-                         f"Inicia sesión y descarga: {url}")
-                    return
-                return  # HTML legítimo — no es binario descargable
+                if not _is_direct_download(job.get("url", "")):
+                    is_login_html = any(sig in preview.lower() for sig in _HTML_BAD_SIGS)
+                    if is_login_html:
+                        raise SessionExpiredError("Sesión expirada detectada en stream.")
+                    # Si es HTML pero no es login -> es un recurso legítimo (ej: external url que no redirecciona a binario)
+                    if b"<!doctype html" in preview.lower() or b"<html" in preview.lower():
+                        # Continuar descarga, se guardará como .html más adelante
+                        pass
+                    else:
+                        _dlq("manual", "El recurso devolvió HTML en lugar de binario.",
+                             f"Abre y guarda manualmente: {url}")
+                        _save_fallback_reference(
+                            "Respuesta HTML no binaria; recurso guardado como acceso manual",
+                            resource_type="html_content",
+                        )
+                        return
 
             # Extraer nombre del servidor (RFC 5987)
             fname = name
@@ -1790,6 +1898,10 @@ def _download_one(
         if bytes_written == 0:
             _dlq("recoverable", "Archivo vacío (0 bytes).",
                  f"Verifica el recurso en Moodle: {url}")
+            _save_fallback_reference(
+                "Archivo vacío detectado (0 bytes); requiere verificación manual",
+                resource_type="empty_download",
+            )
             return
 
         # Validación de tamaño mínimo por tipo
@@ -1799,14 +1911,22 @@ def _download_one(
                  f"Archivo demasiado pequeño ({bytes_written}B) para {ext}. "
                  "Posible descarga parcial o error enmascarado.",
                  f"Verifica el recurso: {url}")
+            _save_fallback_reference(
+                f"Descarga parcial sospechosa ({bytes_written} bytes para {ext})",
+                resource_type="partial_download",
+            )
             return
 
         # Corrupción mid-stream
         with open(tmp_path, "rb") as fh:
             mid = fh.read(2048).lower()
-        if any(s in mid for s in _HTML_BAD_SIGS):
+        if not _is_direct_download(url) and any(s in mid for s in _HTML_BAD_SIGS):
             _dlq("recoverable", "Corrupción mid-stream (sesión revocada).",
                  f"Reinicia sesión y descarga: {url}")
+            _save_fallback_reference(
+                "Corrupción mid-stream detectada; descarga manual recomendada",
+                resource_type="corrupt_stream",
+            )
             return
 
         file_hash  = sha256.hexdigest()
@@ -1884,11 +2004,11 @@ def _download_one(
                 os.remove(tmp_path)
         if lock_acquired:
             _release_posix_lock(lock_fd, lock_path)
-        # Semáforo liberado SIEMPRE — incluso en excepciones
-        # BoundedSemaphore.release() lanza ValueError si ya está en máximo;
-        # suppress(Exception) cubre también el caso de doble-release desde SIGTERM.
-        with contextlib.suppress(Exception):
-            semaphore.release()
+        # Semáforo liberado solo si este job aún tiene el permiso
+        if job.get("_sem_owned"):
+            with contextlib.suppress(Exception):
+                semaphore.release()
+                job["_sem_owned"] = False
 
 
 def downloader(
@@ -1929,9 +2049,11 @@ def downloader(
                     os.fsync(fh.fileno())
             except Exception:
                 pass
-            # Liberar el permiso de semáforo adquirido por este job
-            with contextlib.suppress(Exception):
-                semaphore.release()
+            # Liberar el permiso de semáforo solo si lo posee
+            if job.get("_sem_owned"):
+                with contextlib.suppress(Exception):
+                    semaphore.release()
+                    job["_sem_owned"] = False
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, _dl_sigterm_handler)
@@ -1946,19 +2068,25 @@ def downloader(
         while not stop_workers.is_set():
             try:
                 job = q.get(timeout=2.0)
+                if job == _STOP_SENTINEL:
+                    break
             except queue.Empty:
                 continue
 
-            # Respetar backoff de requeue
+            # Registrar job in-flight INMEDIATAMENTE tras q.get para cerrar
+            # la ventana de pérdida entre dequeue y SIGTERM.
+            _inflight.job = job
+
+            # Respetar backoff de requeue sin desbalancear semáforo
             now = time.time()
             pa  = job.get("process_after", 0)
             if now < pa:
+                # Reencolamos sin liberar permiso. safe_put garantiza no-pérdida.
                 safe_put(q, job)
-                time.sleep(min(pa - now, 1.0))
+                _inflight.job = None
+                time.sleep(0.1) # Breve pausa para no spamear CPU si es el único job
                 continue
 
-            # Registrar job como in-flight ANTES de procesarlo
-            _inflight.job = job
             try:
                 _download_one(
                     job, session, ro_conn_ref, dbq, semaphore,
@@ -1973,6 +2101,17 @@ def downloader(
                         "url":  job.get("url"), "cid": job.get("cid"),
                         "action": f"Descarga manualmente: {job.get('url')}",
                     })
+                    save_url_reference(
+                        ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))),
+                        int(job.get("seq", 1)),
+                        job.get("link_text") or job.get("name") or "recurso",
+                        job.get("url", ""),
+                        job.get("page_origin", ""),
+                        job.get("resource_type", "file"),
+                        f"Fallo terminal tras 3 reintentos: {e}",
+                        ctx_section=job.get("section", ""),
+                        ctx_label=job.get("label_context", ""),
+                    )
             except DiskFullError:
                 log.critical("💀 DISCO LLENO. Worker detenido.")
                 safe_put(dbq, {
@@ -1993,6 +2132,17 @@ def downloader(
                         "msg": f"OSError: {e}",
                         "url": job.get("url"), "cid": job.get("cid"),
                     })
+                    save_url_reference(
+                        ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))),
+                        int(job.get("seq", 1)),
+                        job.get("link_text") or job.get("name") or "recurso",
+                        job.get("url", ""),
+                        job.get("page_origin", ""),
+                        job.get("resource_type", "file"),
+                        f"Fallo terminal OSError tras reintentos: {e}",
+                        ctx_section=job.get("section", ""),
+                        ctx_label=job.get("label_context", ""),
+                    )
             except Exception as e:
                 if not async_requeue_with_backoff(q, job):
                     safe_put(dbq, {
@@ -2001,6 +2151,17 @@ def downloader(
                         "url": job.get("url"), "cid": job.get("cid"),
                         "action": f"Descarga manualmente: {job.get('url')}",
                     })
+                    save_url_reference(
+                        ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))),
+                        int(job.get("seq", 1)),
+                        job.get("link_text") or job.get("name") or "recurso",
+                        job.get("url", ""),
+                        job.get("page_origin", ""),
+                        job.get("resource_type", "file"),
+                        f"Fallo terminal inesperado tras reintentos: {e}",
+                        ctx_section=job.get("section", ""),
+                        ctx_label=job.get("label_context", ""),
+                    )
             finally:
                 # Limpiar referencia in-flight siempre
                 _inflight.job = None
@@ -2293,9 +2454,6 @@ def spider(
         if rows:
             visited.add(norm)
             return
-        # NO marcar como visitado aquí — solo reservar si la navegación tiene éxito.
-        # Un fallo transitorio de red no debe silenciar la URL para el resto del run.
-        # (Fix grieta #3: visited.add movido a post-navigate)
 
         if _should_restart_driver():
             _restart_driver()
@@ -2521,10 +2679,15 @@ def spider(
             _ensure_driver()
             try:
                 task = q.get(timeout=2.0)
+                if task == _STOP_SENTINEL:
+                    break
             except queue.Empty:
                 continue
-            log.info("🕷️  Curso %s → %s", task.get("cid"), task.get("url"))
+
+            # Registrar task in-flight INMEDIATAMENTE tras q.get para cerrar
+            # la ventana de pérdida entre dequeue y SIGTERM.
             _current_task["task"] = task
+            log.info("🕷️  Curso %s → %s", task.get("cid"), task.get("url"))
             try:
                 crawl(task["url"], task["cid"])
             except Exception as e:
@@ -2810,14 +2973,27 @@ def _graceful_shutdown(
     with contextlib.suppress(Exception):
         spider_q.cancel_join_thread()
 
+    # Enviar sentinels a todos los niveles
+    for _ in range(CONFIG["SPIDERS"]):
+        with contextlib.suppress(Exception):
+            spider_q.put_nowait(_STOP_SENTINEL)
+    
     _join_with_timeout(spiders)
+    
+    for _ in range(CONFIG["DOWNLOADERS"]):
+        with contextlib.suppress(Exception):
+            dl_q.put_nowait(_STOP_SENTINEL)
+
     _join_with_timeout(downs)
 
-    # Drenar colas con fsync garantizado
+    # Drenar colas físicas (lo que quede tras sentinels)
     _drain_queue_to_disk(dl_q, "PENDING_DOWNLOADS")
     _drain_queue_to_disk(spider_q, "PENDING_SPIDERS")
 
-    # DB daemon — último en morir (drena completamente)
+    # DB daemon — último en morir
+    with contextlib.suppress(Exception):
+        db_q.put(_STOP_SENTINEL, timeout=5)
+    
     stop_db.set()
     dbp.join(timeout=60)
     if dbp.is_alive():
@@ -2898,34 +3074,14 @@ def main():
 
     log.info("📚 %d cursos en cola.", len(courses))
 
-    # Reingestión de trabajos rescatados de runs anteriores
-    reingest_rescued_jobs(dl_q)
+    log.info("📚 %d cursos en cola.", len(courses))
 
-    # Reingestión de tareas de spider rescatadas (páginas descubiertas en
-    # profundidad durante runs interrumpidos). Los cursos superficiales ya
-    # están en spider_q desde cursos.txt; aquí recuperamos las páginas
-    # internas que el shutdown drenó a disco. (Fix v12 #2)
-    spider_rescue = os.path.join(CONFIG["ROOT_DIR"], "_PENDING_SPIDERS_RESCUED.jsonl")
-    if _path_exists_safe(spider_rescue):
-        reingested_spider = 0
-        with contextlib.suppress(OSError):
-            with open(spider_rescue, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    with contextlib.suppress(Exception):
-                        task = json.loads(line)
-                        # Solo reencolar si tiene url y cid válidos
-                        if task.get("url") and task.get("cid"):
-                            spider_q.put(task)
-                            reingested_spider += 1
-        done_sp = spider_rescue[:-len(".jsonl")] + f".done_{int(time.time())}.bak"
-        with contextlib.suppress(OSError):
-            os.rename(spider_rescue, done_sp)
-        if reingested_spider:
-            log.info("♻️  Spider reingestión: %d tareas recuperadas.", reingested_spider)
+    # Reingestión centralizada de trabajos rescatados de runs anteriores
+    reingest_emergency_data(dl_q, spider_q, db_q, semaphore)
 
     dbp = mp.Process(
         target=db_daemon, args=(db_q, db_path, stop_db),
-        name="DB-Daemon", daemon=True
+        name="DB-Daemon", daemon=False
     )
     dbp.start()
 
@@ -2962,38 +3118,26 @@ def main():
 
     # Esperar spiders con timeout seguro
     _join_with_timeout(spiders)
-    log.info("Spiders finalizados. Drenando descargas pendientes...")
+    log.info("Spiders finalizados. Enviando sentinels a downloaders...")
 
-    # Esperar vaciado de dl_q con deadline de seguridad
-    drain_deadline = time.time() + 600
-    while not dl_q.empty() and not stop_workers.is_set():
-        if time.time() > drain_deadline:
-            log.warning("⚠️  Timeout de drenaje (10 min) alcanzado.")
-            break
-        time.sleep(2)
+    # Shutdown ordenado con sentinels
+    for _ in range(CONFIG["DOWNLOADERS"]):
+        dl_q.put(_STOP_SENTINEL)
 
-    # cancel_join_thread ANTES del join de downloaders (anti-deadlock feeder)
-    with contextlib.suppress(Exception):
-        dl_q.cancel_join_thread()
-    with contextlib.suppress(Exception):
-        spider_q.cancel_join_thread()
-
-    stop_workers.set()
-
-    # Liberar semáforo para desbloquear downloaders en acquire()
-    for _ in range(CONFIG["MAX_IN_FLIGHT"]):
-        try:
-            semaphore.release()
-        except ValueError:
-            break
-
+    # Esperar a los downloaders
     _join_with_timeout(downs)
-    _drain_queue_to_disk(dl_q, "PENDING_DOWNLOADS")
-
-    # DB daemon — el último en morir
+    
+    log.info("Downloaders finalizados. Drenando DB...")
+    
+    # Sentinel para DB daemon
+    db_q.put(_STOP_SENTINEL)
+    
+    stop_workers.set()
     stop_db.set()
     dbp.join(timeout=60)
+    
     if dbp.is_alive():
+        log.warning("DB daemon no cerró a tiempo — SIGTERM")
         dbp.terminate()
         dbp.join(timeout=10)
 

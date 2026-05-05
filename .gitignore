@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database and State
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+egela_state.sqlite
+
+# Logs and Dumps
+*.log
+_EMERGENCY_DUMP_*.jsonl
+_PENDING_*_RESCUED.jsonl
+*.bak
+*.done_*.bak
+
+# Temporary and Lock files
+*.tmp
+.lock_*
+00_DEAD_LETTER_QUEUE.jsonl
+
+# Downloads (User Data)
+EGELA_ENTERPRISE_TIMECAPSULE/
+Curso_*/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Tool metadata
+.sixth/
