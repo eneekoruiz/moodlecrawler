@@ -1,0 +1,261 @@
+diff --git a/crawler.py b/crawler.py
+index 9ad6e04..fdd5696 100644
+--- a/crawler.py
++++ b/crawler.py
+@@ -157,6 +157,9 @@ CONFIG = {
+ _DL_Q_MAXSIZE = CONFIG["MAX_IN_FLIGHT"] * 2
+ _STOP_SENTINEL = {"type": "_STOP_SENTINEL_"}
+ 
++# Shared Registry (mp.Manager) — Eliminamos ventana archivo-escrito -> HASH-en-DB
++_shared_hashes = None 
++
+ _WINDOWS_RESERVED = frozenset({
+     "CON", "PRN", "AUX", "NUL",
+     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+@@ -445,6 +448,7 @@ class StructuredNamer:
+         parts = [f"{ctx.visual_seq:03d}"]
+         link_slug   = _s(ctx.link_text[:50])   if ctx.link_text   else ""
+         server_slug = _s(os.path.splitext(ctx.server_filename or "")[0][:40])
++        parent_slug = _s(ctx.parent_activity[:30]) if ctx.parent_activity else ""
+ 
+         if link_slug and server_slug:
+             if self._similar(link_slug, server_slug):
+@@ -456,6 +460,8 @@ class StructuredNamer:
+             parts.append(link_slug)
+         elif server_slug:
+             parts.append(server_slug)
++        elif parent_slug:
++            parts.append(parent_slug)
+         else:
+             parts.append("_SIN_NOMBRE")
+ 
+@@ -778,12 +784,25 @@ def reingest_emergency_data(dl_q: mp.Queue, spider_q: mp.Queue, db_q: mp.Queue,
+     return counts
+ 
+ 
+-def async_requeue_with_backoff(q: mp.Queue, job: dict) -> bool:
++def async_requeue_with_backoff(q: mp.Queue, job: dict, semaphore: mp.BoundedSemaphore = None) -> bool:
++    """
++    Reencola con backoff exponencial.
++    Mantiene el permiso del semáforo si ya lo posee para evitar deriva.
++    """
+     retries = job.get("retries", 0)
+     if retries >= 3:
++        # Si falla terminalmente, debemos liberar el semáforo si lo tenemos
++        if job.get("_sem_owned") and semaphore:
++            with contextlib.suppress(Exception):
++                semaphore.release()
++                job["_sem_owned"] = False
+         return False
++    
+     job["retries"]       = retries + 1
+     job["process_after"] = time.time() + min(2 ** retries, 30) + random.uniform(0, 1)
++    
++    # Marcamos que el job está en proceso de requeue para que _download_one no libere el semáforo
++    job["_requeuing"] = True
+     safe_put(q, job)
+     return True
+ 
+@@ -1163,6 +1182,15 @@ def _read_with_deadline(
+         raise TransientError(
+             f"Socket timeout de {chunk_timeout}s (TCP half-open detectado)."
+         )
++
++    # Verificación de integridad por tamaño (Anti-Truncamiento)
++    expected = response.headers.get("Content-Length")
++    if expected and int(expected) > 0:
++        if bytes_written != int(expected):
++            raise TransientError(
++                f"Descarga incompleta (truncada): {bytes_written} de {expected} bytes."
++            )
++            
+     return bytes_written
+ 
+ 
+@@ -1419,7 +1447,8 @@ def extract_page_content(
+                 if _is_direct_download(href):
+                     job = {**job_template, "url": href,
+                            "link_text": link_name, "name": link_name,
+-                           "target": target_dir, "resource_type": "file"}
++                           "target": target_dir, "resource_type": "file",
++                           "parent_activity": name}
+                     if _enqueue_download(dl_q, semaphore, job, stop_workers):
+                         found += 1
+                 elif _is_external_save_domain(href):
+@@ -1608,7 +1637,8 @@ def extract_folder_pages(
+                     continue
+                 job = {**job_template, "url": href,
+                        "link_text": aname, "name": aname,
+-                       "target": target_dir, "resource_type": "file"}
++                       "target": target_dir, "resource_type": "file",
++                       "parent_activity": name}
+                 if _enqueue_download(dl_q, semaphore, job, stop_workers):
+                     found += 1
+ 
+@@ -1747,6 +1777,7 @@ def _download_one(
+     db_path: str,
+     ro_ops_counter: list,
+     rate_limiter: DomainRateLimiter,
++    shared_hashes: dict = None,
+ ):
+     """
+     Descarga atómica con tres capas de deduplicación y lock NFS-safe.
+@@ -1941,11 +1972,24 @@ def _download_one(
+         tags       = tagger.extract(ctx)
+         final_path = os.path.join(target_dir, final_name)
+ 
+-        # ── Deduplicación capa 1: hash registry como gate lógico primario ──
++        # ── Deduplicación capa 0: shared memory registry (ultra-fast) ──
++        if shared_hashes is not None and file_hash in shared_hashes:
++            existing_path = shared_hashes[file_hash]
++            if _path_exists_safe(existing_path):
++                if not _path_exists_safe(final_path):
++                    try:
++                        os.link(existing_path, final_path)
++                    except OSError:
++                        shutil.copy2(existing_path, final_path)
++                return
++
++        # ── Deduplicación capa 1: hash registry (DB) ──
+         rows = execute_read_safe(
+             ro_conn_ref[0], "SELECT path FROM hashes WHERE hash=?", (file_hash,)
+         )
+         if rows and _path_exists_safe(rows[0][0]):
++            if shared_hashes is not None:
++                shared_hashes[file_hash] = rows[0][0]
+             if not _path_exists_safe(final_path):
+                 try:
+                     os.link(rows[0][0], final_path)
+@@ -1987,6 +2031,10 @@ def _download_one(
+ 
+         _write_sidecar(final_path, ctx, tags, confidence)
+ 
++        # Actualizar registry compartido antes de liberar lock y enviar a DB
++        if shared_hashes is not None:
++            shared_hashes[file_hash] = final_path
++
+         safe_put(dbq, {
+             "type": "HASH", "hash": file_hash, "path": final_path,
+             "tags": tags, "confidence": confidence,
+@@ -2004,8 +2052,8 @@ def _download_one(
+                 os.remove(tmp_path)
+         if lock_acquired:
+             _release_posix_lock(lock_fd, lock_path)
+-        # Semáforo liberado solo si este job aún tiene el permiso
+-        if job.get("_sem_owned"):
++        # Semáforo liberado solo si NO estamos reencolando y poseemos el permiso
++        if job.get("_sem_owned") and not job.get("_requeuing"):
+             with contextlib.suppress(Exception):
+                 semaphore.release()
+                 job["_sem_owned"] = False
+@@ -2019,6 +2067,7 @@ def downloader(
+     ua: str,
+     db_path: str,
+     semaphore: mp.BoundedSemaphore,
++    shared_hashes: dict = None,
+ ):
+     """
+     Worker de descarga. Stateless — DB es el único source of truth.
+@@ -2077,24 +2126,32 @@ def downloader(
+             # la ventana de pérdida entre dequeue y SIGTERM.
+             _inflight.job = job
+ 
+-            # Respetar backoff de requeue sin desbalancear semáforo
++            # Respetar backoff de requeue manteniendo integridad del semáforo
+             now = time.time()
+             pa  = job.get("process_after", 0)
+             if now < pa:
+-                # Reencolamos sin liberar permiso. safe_put garantiza no-pérdida.
++                # Reencolamos sin liberar permiso. El job conserva _sem_owned = True.
++                # Para evitar busy-loop, dormimos un poco si el job que sacamos aún no está listo.
++                wait_time = min(pa - now, 2.0)
++                if wait_time > 0.1:
++                    time.sleep(wait_time)
++                
+                 safe_put(q, job)
+                 _inflight.job = None
+-                time.sleep(0.1) # Breve pausa para no spamear CPU si es el único job
+                 continue
+ 
++            # Limpiar flag de requeue antes de intentar procesar
++            job["_requeuing"] = False
++            
+             try:
+                 _download_one(
+                     job, session, ro_conn_ref, dbq, semaphore,
+-                    db_path, ro_ops_counter, rate_limiter
++                    db_path, ro_ops_counter, rate_limiter, shared_hashes
+                 )
+             except (TransientError, SessionExpiredError) as e:
+-                # semaphore ya liberado en finally de _download_one
+-                if not async_requeue_with_backoff(q, job):
++                # Si fallamos y vamos a reintentar, async_requeue_with_backoff marcará _requeuing=True
++                if not async_requeue_with_backoff(q, job, semaphore):
++                    # Fallo terminal: la liberación ocurrirá en el sig. bloque o finalmente
+                     safe_put(dbq, {
+                         "type": "DLQ", "severity": "recoverable",
+                         "msg":  f"Fallo tras 3 reintentos: {e}",
+@@ -2144,7 +2201,7 @@ def downloader(
+                         ctx_label=job.get("label_context", ""),
+                     )
+             except Exception as e:
+-                if not async_requeue_with_backoff(q, job):
++                if not async_requeue_with_backoff(q, job, semaphore):
+                     safe_put(dbq, {
+                         "type": "DLQ", "severity": "critical",
+                         "msg": f"Error inesperado: {e}",
+@@ -2197,10 +2254,12 @@ _JS_MAP_UNIVERSAL = """
+     'li.section.main','div.section.main','.course-section',
+     '.grid-section','.tile','.onetopic-tab-content',
+     '.course-content-item','[data-type="section"]',
++    '.section-item','.section.main','[id^="section-"]'
+   ];
+   const sActSel=[
+     '[data-for="cmitem"]','li.activity','div.activity','div.activity-item',
+-    '.activity-item','[data-activityname]',
++    '.activity-item','[data-activityname]','.mod-indent-outer',
++    '.activity-wrapper','.activity-instance'
+   ];
+ 
+   let sections=[];
+@@ -2476,9 +2535,9 @@ def spider(
+                  "Accede manualmente con sesión institucional.")
+             return
+ 
+-        # Navegación exitosa y en dominio propio — ahora sí marcar como visitado
+-        visited.add(norm)
+-        safe_put(dbq, {"type": "VISITED", "url": norm, "cid": cid})
++        # Defer visited marking until AFTER successful navigation and title capture.
++        # This prevents marking pages as visited if the driver dies mid-crawl.
++        # (v12.1 Harden: Post-Extraction Visit Marking)
+         pages_loaded += 1
+ 
+         try:
+@@ -2674,6 +2733,10 @@ def spider(
+ 
+         extract_blobs_safe(d, c_dir, url, dbq)
+ 
++        # Ahora sí, tras extraer todo, marcamos como visitado (Garantía Zero Data Loss)
++        visited.add(norm)
++        safe_put(dbq, {"type": "VISITED", "url": norm, "cid": cid})
++
+     try:
+         while not stop_workers.is_set():
+             _ensure_driver()
+@@ -3094,11 +3157,15 @@ def main():
+         )
+         for i in range(CONFIG["SPIDERS"])
+     ]
++    # Manager para estado compartido ultra-rápido (deduplicación sin ventana)
++    manager = mp.Manager()
++    shared_hashes = manager.dict()
++
+     downs = [
+         mp.Process(
+             target=downloader,
+             args=(dl_q, db_q, stop_workers,
+-                  cookies, ua, db_path, semaphore),
++                  cookies, ua, db_path, semaphore, shared_hashes),
+             name=f"DL-{i + 1}"
+         )
+         for i in range(CONFIG["DOWNLOADERS"])
