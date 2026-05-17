@@ -411,6 +411,127 @@ def _is_nav_trap(url: str) -> bool:
 # §6 — CLASIFICADOR SEMÁNTICO
 # ═══════════════════════════════════════════════════════════════
 
+class ConfidenceEvaluator:
+    """
+    Evaluador de confianza y necesidad de revisión manual para cada recurso.
+    Calcula un score de 0.0 a 1.0 y compila una lista de motivos.
+    """
+    def evaluate(self, ctx: ResourceContext, ctype: str, bytes_written: int, url: str, final_path: str, blocked: bool = False, was_deduplicated: bool = False, is_fallback: bool = False) -> dict:
+        score = 1.0
+        reasons = []
+        evidence = {
+            "section_title": ctx.section_title,
+            "section_index": ctx.section_index,
+            "label_context": ctx.label_context,
+            "parent_activity": ctx.parent_activity,
+            "link_text": ctx.link_text,
+            "server_filename": ctx.server_filename,
+            "content_type": ctype,
+            "url_pattern": url,
+            "hash_duplicate": was_deduplicated,
+            "fallback_manual": is_fallback,
+            "blocked": blocked
+        }
+
+        # Contexto desconocido o 99_Sin_Contexto
+        if ctx.context_confidence == "unknown" or "99_Sin_Contexto" in final_path:
+            score -= 0.8
+            reasons.append("contexto desconocido / 99_Sin_Contexto")
+
+        # Sección ambigua o genérica
+        if not ctx.section_title or any(kw in ctx.section_title.lower() for kw in ("general", "tema", "sección", "seccion", "modulo", "unidad")):
+            if ctx.section_title == "00_General" or not ctx.section_title:
+                score -= 0.3
+                reasons.append("sección ambigua o genérica")
+
+        # Label propagado con baja confianza
+        if ctx.label_context and len(ctx.label_context) > CONFIG["MAX_LABEL_PROPAGATION"]:
+            score -= 0.2
+            reasons.append("label propagado con baja confianza")
+
+        # Título vacío o genérico
+        if not ctx.link_text or ctx.link_text.strip().lower() in ("recurso", "descarga", "archivo", "file", "document", "click aquí", "enlace"):
+            score -= 0.3
+            reasons.append("título vacío o genérico")
+
+        # Nombre de archivo generado artificialmente
+        if not ctx.link_text and not ctx.server_filename:
+            score -= 0.5
+            reasons.append("nombre de archivo generado artificialmente")
+
+        # Server filename contradice link text
+        if ctx.link_text and ctx.server_filename:
+            link_slug = _s(ctx.link_text)
+            server_slug = _s(os.path.splitext(ctx.server_filename)[0])
+            if not StructuredNamer._similar(link_slug, server_slug):
+                score -= 0.3
+                reasons.append("server filename contradice link text")
+
+        # MIME y extensión no cuadran
+        ext = os.path.splitext(final_path)[1].lower()
+        expected_ext = _get_ext(ctype or "", ctx.server_filename or "")
+        if ext and expected_ext and ext != expected_ext:
+            score -= 0.4
+            reasons.append(f"MIME y extensión no cuadran ({ctype} -> {expected_ext} vs {ext})")
+
+        # Content-Length ausente o sospechoso / descarga demasiado pequeña
+        min_sizes = {".pdf": 512, ".docx": 512, ".pptx": 512, ".xlsx": 512, ".zip": 22}
+        if bytes_written > 0 and bytes_written < min_sizes.get(ext, 0):
+            score -= 0.4
+            reasons.append(f"descarga demasiado pequeña para el tipo esperado ({bytes_written} bytes)")
+
+        # HTML en lugar de binario
+        if ctype and "text/html" in ctype.lower() and ext not in (".html", ".htm"):
+            score -= 0.6
+            reasons.append("HTML en lugar de binario")
+
+        # Recurso externo no descargado
+        if is_fallback:
+            score -= 0.5
+            reasons.append("recurso externo no descargado (guardado enlace)")
+
+        # Blob extraído sin contexto
+        if "BLOB_" in os.path.basename(final_path):
+            score -= 0.6
+            reasons.append("blob extraído sin contexto")
+
+        # Deduplicado con nombre/contexto distinto al original
+        if was_deduplicated:
+            score -= 0.2
+            reasons.append("deduplicado con nombre/contexto distinto al original")
+
+        # Ruta acortada por longitud
+        orig_basename = ctx.link_text or ctx.server_filename or ""
+        final_basename = os.path.basename(final_path)
+        if len(orig_basename) > 10 and len(final_basename) < len(orig_basename) - 20:
+            score -= 0.1
+            reasons.append("ruta acortada por longitud")
+
+        if blocked:
+            score -= 0.6
+            reasons.append("recurso bloqueado/oculto/restringido")
+
+        score = max(0.0, min(1.0, score))
+        if score >= 0.85 and not reasons:
+            level = "high"
+            review_required = False
+        elif score >= 0.6:
+            level = "medium"
+            review_required = True
+        else:
+            level = "low"
+            review_required = True
+
+        return {
+            "confidence_score": round(score, 2),
+            "confidence_level": level,
+            "review_required": review_required,
+            "review_reasons": reasons,
+            "decision_trace": f"Ubicado en {os.path.basename(os.path.dirname(final_path))} con nombre {final_basename} usando certeza {level}.",
+            "source_evidence": evidence
+        }
+
+
 class EvidenceBasedClassifier:
     """
     Carpeta destino basada en evidencia DOM explícita.
@@ -419,10 +540,10 @@ class EvidenceBasedClassifier:
 
     def classify(self, ctx: ResourceContext, course_dir: str) -> tuple:
         if ctx.section_title and ctx.section_title not in ("00_General", ""):
-            title_slug = _s(ctx.section_title[:80])
+            title_slug = _s(ctx.section_title[:40])
             title_hash = hashlib.md5(
                 ctx.section_title.encode("utf-8", errors="replace")
-            ).hexdigest()[:4]
+            ).hexdigest()[:3]
             sec_folder = f"{ctx.section_index + 1:02d}_{title_slug}_{title_hash}"
             confidence = "high"
         else:
@@ -432,12 +553,12 @@ class EvidenceBasedClassifier:
         base = os.path.join(course_dir, sec_folder)
 
         if ctx.label_context and ctx.label_context.strip():
-            base = os.path.join(base, _s(ctx.label_context[:60]))
+            base = os.path.join(base, _s(ctx.label_context[:35]))
         elif confidence == "high":
             confidence = "partial"
 
         if ctx.parent_activity:
-            base = os.path.join(base, _s(ctx.parent_activity[:60]))
+            base = os.path.join(base, _s(ctx.parent_activity[:35]))
 
         ctx.context_confidence = confidence
         return ensure(base), confidence
@@ -498,7 +619,7 @@ class TagExtractor:
 
 
 def _write_sidecar(
-    file_path: str, ctx: ResourceContext, tags: List[str], confidence: str
+    file_path: str, ctx: ResourceContext, tags: List[str], confidence: str, confidence_eval: dict = None
 ):
     meta = {
         "origen": {
@@ -523,11 +644,14 @@ def _write_sidecar(
             if confidence == "unknown" else None
         ),
         "hash_sha256": ctx.file_hash,
+        "revision_manual": confidence_eval,
         "generado_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     try:
         with open(file_path + ".meta.json", "w", encoding="utf-8") as fh:
             json.dump(meta, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError:
         pass
 
@@ -609,7 +733,7 @@ class BoundedVisitedSet:
             try:
                 conn.execute("PRAGMA journal_mode = WAL;")
                 rows = conn.execute(
-                    "SELECT url FROM visited ORDER BY ts DESC LIMIT ?",
+                    "SELECT url FROM visited WHERE status IN ('completed', 'manual') ORDER BY ts DESC LIMIT ?",
                     (self._max,)
                 ).fetchall()
                 for (url,) in rows:
@@ -717,53 +841,74 @@ class DownloadPermit:
             self.acquired = False
             self.job["_sem_owned"] = False
 
-def reingest_emergency_data(dl_q: mp.Queue, spider_q: mp.Queue, db_q: mp.Queue, semaphore: mp.BoundedSemaphore) -> dict:
+def reingest_emergency_data_worker(dl_q: mp.Queue, spider_q: mp.Queue, db_q: mp.Queue, semaphore: mp.BoundedSemaphore, active_downloads_count: mp.Value, stop_workers: mp.Event):
     """
-    Reingestión centralizada ATÓMICA.
-    Usa os.replace para garantizar que no se pierdan datos si el arranque se interrumpe.
+    Trabajador de reingestión en hilo de background para evitar bloquear el arranque
+    y resolver de forma segura la adquisición de semáforos a medida que se liberan slots.
     """
     patterns = [
         os.path.join(CONFIG["ROOT_DIR"], "_EMERGENCY_DUMP_*.jsonl"),
         os.path.join(CONFIG["ROOT_DIR"], "_*_RESCUED.jsonl"),
     ]
-    counts = {"DOWNLOAD_JOB": 0, "SPIDER_TASK": 0, "DB_EVENT": 0}
     
     for fpath in [f for pat in patterns for f in glob.glob(pat)]:
         if not fpath.endswith(".jsonl"): continue
         
         remaining = []
+        counts = {"DOWNLOAD_JOB": 0, "SPIDER_TASK": 0, "DB_EVENT": 0}
+        
         try:
             with open(fpath, "r", encoding="utf-8") as fh:
                 for line in fh:
+                    if stop_workers.is_set():
+                        remaining.append(line)
+                        continue
+                    
                     try:
                         item = json.loads(line)
-                        t = item.get("type")
+                    except json.JSONDecodeError:
+                        corrupt_file = os.path.join(CONFIG["ROOT_DIR"], "00_CORRUPT_RESCUES.jsonl")
+                        with contextlib.suppress(Exception):
+                            with open(corrupt_file, "a", encoding="utf-8") as cfh:
+                                cfh.write(line)
+                        continue
                         
-                        if t in ("VISITED", "HASH", "DLQ"):
-                            if safe_put(db_q, item): counts["DB_EVENT"] += 1
-                            else: remaining.append(line)
-                        elif "cid" in item and "url" in item:
-                            if "section" in item or "target" in item:
-                                if semaphore.acquire(block=False):
-                                    item["_sem_owned"] = True
-                                    if safe_put(dl_q, item): counts["DOWNLOAD_JOB"] += 1
-                                    else:
-                                        semaphore.release()
-                                        item.pop("_sem_owned", None)
-                                        remaining.append(line)
+                    t = item.get("type")
+                    
+                    if t in ("VISITED", "HASH", "DLQ"):
+                        if safe_put(db_q, item): counts["DB_EVENT"] += 1
+                        else: remaining.append(line)
+                    elif "cid" in item and "url" in item:
+                        if "section" in item or "target" in item:
+                            acquired = False
+                            while not stop_workers.is_set():
+                                if semaphore.acquire(timeout=1.0):
+                                    acquired = True
+                                    break
+                            
+                            if acquired:
+                                item["_sem_owned"] = True
+                                item["_requeuing"] = False
+                                if safe_put(dl_q, item):
+                                    counts["DOWNLOAD_JOB"] += 1
+                                    if active_downloads_count is not None:
+                                        with active_downloads_count.get_lock():
+                                            active_downloads_count.value += 1
                                 else:
+                                    semaphore.release()
+                                    item.pop("_sem_owned", None)
                                     remaining.append(line)
                             else:
-                                if safe_put(spider_q, item): counts["SPIDER_TASK"] += 1
-                                else: remaining.append(line)
+                                remaining.append(line)
                         else:
-                            remaining.append(line)
-                    except Exception:
+                            if safe_put(spider_q, item): counts["SPIDER_TASK"] += 1
+                            else: remaining.append(line)
+                    else:
                         remaining.append(line)
-        except OSError:
+        except OSError as e:
+            log.error("Error al abrir archivo de reingestión %s: %s", fpath, e)
             continue
 
-        # Reemplazo atómico del fichero con el sobrante
         if remaining:
             tmp_f = fpath + ".tmp"
             try:
@@ -779,9 +924,83 @@ def reingest_emergency_data(dl_q: mp.Queue, spider_q: mp.Queue, db_q: mp.Queue, 
             with contextlib.suppress(OSError):
                 os.replace(fpath, done)
 
-    for k, v in counts.items():
-        if v: log.info("♻️  Reingestión %s: %d items recuperados.", k, v)
-    return counts
+        for k, v in counts.items():
+            if v: log.info("♻️  Reingestión %s: %d items recuperados del archivo %s.", k, v, os.path.basename(fpath))
+
+
+def reingest_emergency_data(dl_q: mp.Queue, spider_q: mp.Queue, db_q: mp.Queue, semaphore: mp.BoundedSemaphore) -> dict:
+    """
+    Reingestión centralizada de trabajos rescatados síncrona (retrocompatibilidad con tests).
+    """
+    patterns = [
+        os.path.join(CONFIG["ROOT_DIR"], "_EMERGENCY_DUMP_*.jsonl"),
+        os.path.join(CONFIG["ROOT_DIR"], "_*_RESCUED.jsonl"),
+    ]
+    
+    total_counts = {"DOWNLOAD_JOB": 0, "SPIDER_TASK": 0, "DB_EVENT": 0}
+    
+    for fpath in [f for pat in patterns for f in glob.glob(pat)]:
+        if not fpath.endswith(".jsonl"): continue
+        
+        remaining = []
+        counts = {"DOWNLOAD_JOB": 0, "SPIDER_TASK": 0, "DB_EVENT": 0}
+        
+        try:
+            with open(fpath, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                        
+                    t = item.get("type")
+                    if t in ("VISITED", "HASH", "DLQ"):
+                        if safe_put(db_q, item):
+                            counts["DB_EVENT"] += 1
+                        else:
+                            remaining.append(line)
+                    elif "cid" in item and "url" in item:
+                        if "section" in item or "target" in item:
+                            if semaphore.acquire(timeout=1.0):
+                                item["_sem_owned"] = True
+                                item["_requeuing"] = False
+                                if safe_put(dl_q, item):
+                                    counts["DOWNLOAD_JOB"] += 1
+                                else:
+                                    semaphore.release()
+                                    item.pop("_sem_owned", None)
+                                    remaining.append(line)
+                            else:
+                                remaining.append(line)
+                        else:
+                            if safe_put(spider_q, item):
+                                counts["SPIDER_TASK"] += 1
+                            else:
+                                remaining.append(line)
+                    else:
+                        remaining.append(line)
+        except OSError:
+            continue
+            
+        if remaining:
+            tmp_f = fpath + ".tmp"
+            try:
+                with open(tmp_f, "w", encoding="utf-8") as fh:
+                    fh.writelines(remaining)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_f, fpath)
+            except OSError:
+                pass
+        else:
+            done = fpath[:-len(".jsonl")] + f".done_{int(time.time())}.bak"
+            with contextlib.suppress(OSError):
+                os.replace(fpath, done)
+                
+        for k, v in counts.items():
+            total_counts[k] += v
+            
+    return total_counts
 
 
 def async_requeue_with_backoff(q: mp.Queue, job: dict, semaphore: mp.BoundedSemaphore = None) -> bool:
@@ -791,20 +1010,27 @@ def async_requeue_with_backoff(q: mp.Queue, job: dict, semaphore: mp.BoundedSema
     """
     retries = job.get("retries", 0)
     if retries >= 3:
-        # Si falla terminalmente, debemos liberar el semáforo si lo tenemos
         if job.get("_sem_owned") and semaphore:
             with contextlib.suppress(Exception):
                 semaphore.release()
-                job["_sem_owned"] = False
+        job["_sem_owned"] = False
         return False
     
     job["retries"]       = retries + 1
     job["process_after"] = time.time() + min(2 ** retries, 30) + random.uniform(0, 1)
     
-    # Marcamos que el job está en proceso de requeue para que _download_one no libere el semáforo
     job["_requeuing"] = True
-    safe_put(q, job)
-    return True
+    
+    if safe_put(q, job):
+        return True
+    else:
+        if job.get("_sem_owned") and semaphore:
+            with contextlib.suppress(Exception):
+                semaphore.release()
+        job["_sem_owned"] = False
+        job["_requeuing"] = False
+        log.error("Fallo crítico al reencolar job %s — volcado a disco y liberado semáforo.", job.get("url"))
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -821,7 +1047,7 @@ def init_db(path: str):
             PRAGMA wal_autocheckpoint    = 0;
             PRAGMA journal_size_limit    = {CONFIG['WAL_JOURNAL_SIZE_LIMIT']};
             CREATE TABLE IF NOT EXISTS visited (
-                url TEXT PRIMARY KEY, cid TEXT, ts REAL
+                url TEXT PRIMARY KEY, cid TEXT, status TEXT, ts REAL
             );
             CREATE TABLE IF NOT EXISTS hashes (
                 hash TEXT PRIMARY KEY, path TEXT, tags TEXT, ts REAL
@@ -832,6 +1058,12 @@ def init_db(path: str):
                 context TEXT, action TEXT, cid TEXT, ts REAL
             );
         """)
+        # Migración: Añadir columna status si la tabla ya existía sin ella
+        try:
+            conn.execute("ALTER TABLE visited ADD COLUMN status TEXT DEFAULT 'completed'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # La columna ya existe o la tabla no existía (y se creó con ella)
 
 
 def _open_db_ro(path: str) -> sqlite3.Connection:
@@ -893,7 +1125,7 @@ def write_dlq_direct(ev: dict):
         log.error("No se pudo escribir en DLQ: %s", exc)
 
 
-def db_daemon(q: mp.Queue, db_path: str, stop: mp.Event):
+def db_daemon(q: mp.Queue, db_path: str, stop: mp.Event, shared_persisted_hashes: dict = None):
     """
     Único escritor SQLite (patrón DB daemon).
     WAL PASSIVE periódico durante ejecución. TRUNCATE solo al cierre.
@@ -912,8 +1144,8 @@ def db_daemon(q: mp.Queue, db_path: str, stop: mp.Event):
         t = ev.get("type")
         if t == "VISITED":
             conn.execute(
-                "INSERT OR IGNORE INTO visited VALUES (?,?,?)",
-                (ev["url"], ev.get("cid", ""), time.time())
+                "INSERT OR REPLACE INTO visited (url, cid, status, ts) VALUES (?,?,?,?)",
+                (ev["url"], ev.get("cid", ""), ev.get("status", "completed"), time.time())
             )
             conn.commit()
         elif t == "HASH":
@@ -923,6 +1155,8 @@ def db_daemon(q: mp.Queue, db_path: str, stop: mp.Event):
                  json.dumps(ev.get("tags", [])), time.time())
             )
             conn.commit()
+            if shared_persisted_hashes is not None:
+                shared_persisted_hashes[ev["hash"]] = True
         elif t == "DLQ":
             write_dlq_direct(ev)
         event_counter += 1
@@ -1251,6 +1485,7 @@ def save_url_reference(
     ctx_section: str = "",
     ctx_label: str = "",
     extra: dict = None,
+    confidence_eval: dict = None,
 ) -> str:
     """
     Zero Data Loss para recursos no descargables.
@@ -1271,16 +1506,42 @@ def save_url_reference(
     except OSError:
         return ""
 
+    if confidence_eval is None:
+        evaluator = ConfidenceEvaluator()
+        ctx = ResourceContext(
+            section_title=ctx_section,
+            section_index=99,
+            visual_seq=seq,
+            link_text=name,
+            label_context=ctx_label,
+            parent_activity=None,
+            server_filename=None,
+            content_type="text/html",
+            source_url=url,
+            page_origin=origin_url,
+            file_hash="",
+            resource_type=resource_type,
+            extra_meta=extra or {}
+        )
+        confidence_eval = evaluator.evaluate(
+            ctx, "text/html", 0, url, fpath,
+            was_deduplicated=False, is_fallback=True
+        )
+
     meta = {
         "tipo_recurso":    resource_type,
         "titulo":          name,
-        "url_original":    url,
+        "url":             url,
         "pagina_origen":   origin_url,
-        "motivo_fallback": reason,
-        "contexto":        {"seccion": ctx_section, "etiqueta": ctx_label},
-        "meta_extra":      extra or {},
-        "accion_manual":   f"Abre esta URL en el navegador: {url}",
-        "generado_ts":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "razon_no_descargado": reason,
+        "contexto_moodle": {
+            "seccion":  ctx_section,
+            "etiqueta": ctx_label,
+            "secuencia": seq,
+        },
+        "revision_manual": confidence_eval,
+        "extra_meta": extra or {},
+        "generado_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     try:
         with open(fpath + ".meta.json", "w", encoding="utf-8") as fh:
@@ -1289,89 +1550,15 @@ def save_url_reference(
             os.fsync(fh.fileno())
     except OSError:
         pass
-
-    log.info("🔗 Referencia guardada: %s [%s]", fname, resource_type)
     return fpath
 
-
-# ═══════════════════════════════════════════════════════════════
-# §15 — AUTENTICACIÓN Y SESIÓN HTTP
-# ═══════════════════════════════════════════════════════════════
-
-def auth() -> tuple:
-    """Login con verificación de sesión real. Driver cerrado en finally."""
-    log.info("🔑 Global Auth (SSO)…")
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.page_load_strategy = "eager"
-    d = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()), options=opts
-    )
-    d.set_page_load_timeout(30)
-    try:
-        d.get(CONFIG["LOGIN_URL"])
-        with contextlib.suppress(Exception):
-            d.execute_script(
-                "document.querySelectorAll('.modal-backdrop,.modal')"
-                ".forEach(e=>e.remove());"
-                "document.body.classList.remove('modal-open');"
-            )
-        d.find_element(By.ID, "username").send_keys(CONFIG["USERNAME"])
-        d.find_element(By.ID, "password").send_keys(CONFIG["PASSWORD"])
-        d.find_element(By.ID, "loginbtn").click()
-        time.sleep(3)
-        cookies = {c["name"]: c["value"] for c in d.get_cookies()}
-        ua = d.execute_script(
-            "return navigator.userAgent;"
-        ).replace("HeadlessChrome", "Chrome")
-        if not cookies:
-            raise RuntimeError("Login fallido: sin cookies.")
-        # Verificación de sesión real — no solo cookies
-        probe_session = requests.Session()
-        probe_session.cookies.update(cookies)
-        probe_session.headers.update({"User-Agent": ua})
-        try:
-            probe = probe_session.get(
-                f"https://{CONFIG['DOMAIN']}/my/",
-                timeout=10, allow_redirects=True
-            )
-            if "login" in probe.url.lower():
-                raise RuntimeError("Login fallido: redirección al login.")
-        finally:
-            probe_session.close()
-        log.info("✅  Login y sesión verificados.")
-        return cookies, ua
-    finally:
-        with contextlib.suppress(Exception):
-            d.quit()
-
-
-def build_session(cookies: dict, ua: str) -> requests.Session:
-    s = requests.Session()
-    s.cookies.update(cookies)
-    s.headers.update({"User-Agent": ua})
-    retry = Retry(
-        total=5, backoff_factor=1.0,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD"],
-        respect_retry_after_header=True,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://",  HTTPAdapter(max_retries=retry))
-    return s
-
-
-# ═══════════════════════════════════════════════════════════════
-# §16 — EXTRACTORES ESPECIALIZADOS
-# ═══════════════════════════════════════════════════════════════
 
 def _enqueue_download(
     dq: mp.Queue,
     semaphore: mp.BoundedSemaphore,
     job: dict,
     stop_workers: mp.Event,
+    active_downloads_count: mp.Value = None,
 ) -> bool:
     """
     Adquiere semáforo y encola. Si safe_put falla, libera semáforo.
@@ -1385,6 +1572,9 @@ def _enqueue_download(
         if safe_put(dq, job):
             # El permiso ahora pertenece al job en la cola, no a este contexto
             permit.acquired = False 
+            if active_downloads_count is not None:
+                with active_downloads_count.get_lock():
+                    active_downloads_count.value += 1
             return True
         return False
 
@@ -1401,6 +1591,7 @@ def extract_page_content(
     semaphore: mp.BoundedSemaphore,
     dl_q: mp.Queue,
     stop_workers: mp.Event,
+    active_downloads_count: mp.Value = None,
 ) -> int:
     """
     Extrae contenido de mod/page y mod/book.
@@ -1449,7 +1640,7 @@ def extract_page_content(
                            "link_text": link_name, "name": link_name,
                            "target": target_dir, "resource_type": "file",
                            "parent_activity": name}
-                    if _enqueue_download(dl_q, semaphore, job, stop_workers):
+                    if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
                         found += 1
                 elif _is_external_save_domain(href):
                     save_url_reference(
@@ -1497,6 +1688,7 @@ def extract_assign_content(
     job_template: dict,
     dbq: mp.Queue,
     stop_workers: mp.Event,
+    active_downloads_count: mp.Value = None,
 ) -> int:
     """
     Extrae materiales de apoyo de mod/assign (enunciados, plantillas, adjuntos).
@@ -1534,7 +1726,7 @@ def extract_assign_content(
                    "link_text": aname, "name": aname,
                    "target": target_dir, "resource_type": "file",
                    "parent_activity": name}
-            if _enqueue_download(dl_q, semaphore, job, stop_workers):
+            if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
                 found += 1
     except Exception:
         pass
@@ -1554,6 +1746,7 @@ def extract_forum_attachments(
     visited: BoundedVisitedSet,
     dbq: mp.Queue,
     stop_workers: mp.Event,
+    active_downloads_count: mp.Value = None,
 ) -> int:
     """Navega hilos del foro y extrae adjuntos. Máximo 20 hilos."""
     ensure(target_dir)
@@ -1584,7 +1777,7 @@ def extract_forum_attachments(
                            "link_text": aname, "name": aname,
                            "target": target_dir, "resource_type": "file",
                            "parent_activity": name}
-                    if _enqueue_download(dl_q, semaphore, job, stop_workers):
+                    if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
                         found += 1
             except Exception:
                 continue
@@ -1606,6 +1799,7 @@ def extract_folder_pages(
     visited: BoundedVisitedSet,
     dbq: mp.Queue,
     stop_workers: mp.Event,
+    active_downloads_count: mp.Value = None,
 ) -> int:
     """
     Navega TODAS las páginas de un mod/folder con paginación.
@@ -1639,7 +1833,7 @@ def extract_folder_pages(
                        "link_text": aname, "name": aname,
                        "target": target_dir, "resource_type": "file",
                        "parent_activity": name}
-                if _enqueue_download(dl_q, semaphore, job, stop_workers):
+                if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
                     found += 1
 
             # Siguiente página de paginación
@@ -1778,6 +1972,7 @@ def _download_one(
     ro_ops_counter: list,
     rate_limiter: DomainRateLimiter,
     shared_hashes: dict = None,
+    shared_persisted_hashes: dict = None,
 ):
     """
     Descarga atómica con tres capas de deduplicación y lock NFS-safe.
@@ -1804,12 +1999,20 @@ def _download_one(
     lock_fd       = -1
     lock_path     = None
     lock_acquired = False
+    fname         = name
+    ctype         = ""
 
     def _dlq(severity: str, msg: str, action: str = ""):
         safe_put(dbq, {"type": "DLQ", "severity": severity,
                         "msg": msg, "url": url, "cid": cid, "action": action})
 
     def _save_fallback_reference(reason: str, resource_type: str = "file"):
+        evaluator = ConfidenceEvaluator()
+        ctx_fb = _build_resource_context(job, fname or "", "", ctype or "")
+        confidence_eval = evaluator.evaluate(
+            ctx_fb, ctype or "", 0, url, os.path.join(target_dir, f"{seq:03d}_{_s(name[:60])}_{resource_type.upper()}.url"),
+            was_deduplicated=False, is_fallback=True
+        )
         save_url_reference(
             target_dir,
             seq,
@@ -1820,11 +2023,11 @@ def _download_one(
             reason,
             ctx_section=job.get("section", ""),
             ctx_label=job.get("label_context", ""),
+            extra={"parent_activity": job.get("parent_activity", "")},
+            confidence_eval=confidence_eval
         )
 
     # Refresh periódico de ro_conn para evitar bloqueo de WAL checkpoint.
-    # ro_conn_ref[0] se modifica in-place: el nuevo objeto es visible desde
-    # downloader() sin necesidad de valor de retorno.
     ro_ops_counter[0] += 1
     if ro_ops_counter[0] >= CONFIG["RO_CONN_REFRESH_OPS"]:
         with contextlib.suppress(Exception):
@@ -1857,12 +2060,9 @@ def _download_one(
             if r.status_code != 200:
                 _dlq("recoverable", f"HTTP {r.status_code}.",
                      f"Descarga manualmente: {url}")
-                save_url_reference(
-                    target_dir, seq, name, url, job.get("page_origin", ""),
-                    job.get("resource_type", "file"),
+                _save_fallback_reference(
                     f"HTTP {r.status_code} — descarga fallida",
-                    ctx_section=job.get("section", ""),
-                    ctx_label=job.get("label_context", ""),
+                    resource_type=job.get("resource_type", "file")
                 )
                 return
 
@@ -1875,9 +2075,7 @@ def _download_one(
                     is_login_html = any(sig in preview.lower() for sig in _HTML_BAD_SIGS)
                     if is_login_html:
                         raise SessionExpiredError("Sesión expirada detectada en stream.")
-                    # Si es HTML pero no es login -> es un recurso legítimo (ej: external url que no redirecciona a binario)
                     if b"<!doctype html" in preview.lower() or b"<html" in preview.lower():
-                        # Continuar descarga, se guardará como .html más adelante
                         pass
                     else:
                         _dlq("manual", "El recurso devolvió HTML en lugar de binario.",
@@ -1906,15 +2104,12 @@ def _download_one(
 
             # tmp en el mismo directorio que el destino (garantiza mismo FS)
             tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=target_dir, suffix=".tmp",
+                dir=target_dir, suffix=".part",
                 prefix=f".dl_{os.getpid()}_"
             )
             sha256        = hashlib.sha256()
             bytes_written = 0
 
-            # os.fdopen transfiere la propiedad del fd.
-            # Establecemos tmp_fd = -1 INMEDIATAMENTE dentro del with,
-            # garantizando que el finally nunca intente cerrar un fd ya cedido.
             try:
                 with os.fdopen(tmp_fd, "wb") as tmp_f:
                     tmp_fd = -1  # propiedad transferida — NO cerrar en finally
@@ -1922,8 +2117,6 @@ def _download_one(
                         r, sha256, tmp_f, prefix=preview
                     )
             except Exception:
-                # Si os.fdopen falla antes del assignment, tmp_fd queda válido
-                # y el finally lo cierra. Si falla después, tmp_fd ya es -1.
                 raise
 
         if bytes_written == 0:
@@ -1981,6 +2174,12 @@ def _download_one(
                         os.link(existing_path, final_path)
                     except OSError:
                         shutil.copy2(existing_path, final_path)
+                evaluator = ConfidenceEvaluator()
+                confidence_eval = evaluator.evaluate(
+                    ctx, ctype, bytes_written, url, final_path,
+                    was_deduplicated=True, is_fallback=False
+                )
+                _write_sidecar(final_path, ctx, tags, confidence, confidence_eval)
                 return
 
         # ── Deduplicación capa 1: hash registry (DB) ──
@@ -1988,13 +2187,20 @@ def _download_one(
             ro_conn_ref[0], "SELECT path FROM hashes WHERE hash=?", (file_hash,)
         )
         if rows and _path_exists_safe(rows[0][0]):
+            existing_path = rows[0][0]
             if shared_hashes is not None:
-                shared_hashes[file_hash] = rows[0][0]
+                shared_hashes[file_hash] = existing_path
             if not _path_exists_safe(final_path):
                 try:
-                    os.link(rows[0][0], final_path)
+                    os.link(existing_path, final_path)
                 except OSError:
-                    shutil.copy2(rows[0][0], final_path)
+                    shutil.copy2(existing_path, final_path)
+            evaluator = ConfidenceEvaluator()
+            confidence_eval = evaluator.evaluate(
+                ctx, ctype, bytes_written, url, final_path,
+                was_deduplicated=True, is_fallback=False
+            )
+            _write_sidecar(final_path, ctx, tags, confidence, confidence_eval)
             return
 
         # ── POSIX lock NFS-safe ──
@@ -2009,18 +2215,25 @@ def _download_one(
             ro_conn_ref[0], "SELECT path FROM hashes WHERE hash=?", (file_hash,)
         )
         if rows2 and _path_exists_safe(rows2[0][0]):
+            existing_path = rows2[0][0]
             if not _path_exists_safe(final_path):
                 try:
-                    os.link(rows2[0][0], final_path)
+                    os.link(existing_path, final_path)
                 except OSError:
-                    shutil.copy2(rows2[0][0], final_path)
+                    shutil.copy2(existing_path, final_path)
+            evaluator = ConfidenceEvaluator()
+            confidence_eval = evaluator.evaluate(
+                ctx, ctype, bytes_written, url, final_path,
+                was_deduplicated=True, is_fallback=False
+            )
+            _write_sidecar(final_path, ctx, tags, confidence, confidence_eval)
             return
 
         # ── Escritura atómica con fsync de directorio ──
         _atomic_replace(tmp_path, final_path, expected_hash=file_hash)
         tmp_path = None  # Ya movido — finally no debe borrarlo
 
-        # Verificación de integridad post-write (en chunks — sin RAM spike)
+        # Verificación de integridad post-write
         post_hash = _file_sha256_chunked(final_path)
         if post_hash != file_hash:
             with contextlib.suppress(OSError):
@@ -2029,7 +2242,13 @@ def _download_one(
                 f"Corrupción I/O post-write: {file_hash[:8]}≠{post_hash[:8]}."
             )
 
-        _write_sidecar(final_path, ctx, tags, confidence)
+        evaluator = ConfidenceEvaluator()
+        confidence_eval = evaluator.evaluate(
+            ctx, ctype, bytes_written, url, final_path,
+            was_deduplicated=False, is_fallback=False
+        )
+
+        _write_sidecar(final_path, ctx, tags, confidence, confidence_eval)
 
         # Actualizar registry compartido antes de liberar lock y enviar a DB
         if shared_hashes is not None:
@@ -2041,6 +2260,13 @@ def _download_one(
         })
         log.info("⬇️  %s [%.1f MB] [%s]", final_name,
                  bytes_written / (1024 * 1024), confidence)
+
+        # ESCUDO DE DEDUPLICACIÓN SÍNCRONA:
+        # Esperamos a que el DB daemon confirme la persistencia en SQLite
+        if shared_persisted_hashes is not None:
+            t0 = time.monotonic()
+            while file_hash not in shared_persisted_hashes and time.monotonic() - t0 < 5.0:
+                time.sleep(0.01)
 
     finally:
         # Cierre garantizado de TODOS los recursos — orden importa
@@ -2068,6 +2294,8 @@ def downloader(
     db_path: str,
     semaphore: mp.BoundedSemaphore,
     shared_hashes: dict = None,
+    shared_persisted_hashes: dict = None,
+    active_downloads_count: mp.Value = None,
 ):
     """
     Worker de descarga. Stateless — DB es el único source of truth.
@@ -2098,7 +2326,6 @@ def downloader(
                     os.fsync(fh.fileno())
             except Exception:
                 pass
-            # Liberar el permiso de semáforo solo si lo posee
             if job.get("_sem_owned"):
                 with contextlib.suppress(Exception):
                     semaphore.release()
@@ -2112,52 +2339,73 @@ def downloader(
     ro_conn_ref    = [_open_db_ro(db_path)]   # lista mutable — _download_one refresca in-place
     ro_ops_counter = [0]
     rate_limiter   = DomainRateLimiter(rps=CONFIG["RATE_LIMIT_RPS"])
+    local_delayed_jobs = []
 
     try:
         while not stop_workers.is_set():
-            try:
-                job = q.get(timeout=2.0)
-                if job == _STOP_SENTINEL:
+            now = time.time()
+            # 1. Procesar cualquier job local que ya esté listo
+            ready_job = None
+            for idx, job in enumerate(local_delayed_jobs):
+                if now >= job.get("process_after", 0):
+                    ready_job = local_delayed_jobs.pop(idx)
                     break
-            except queue.Empty:
-                continue
+            
+            if ready_job is not None:
+                job = ready_job
+            else:
+                # Calcular timeout dinámico para q.get
+                if local_delayed_jobs:
+                    min_pa = min(j.get("process_after", 0) for j in local_delayed_jobs)
+                    q_timeout = max(0.01, min(min_pa - now, 2.0))
+                else:
+                    q_timeout = 2.0
+                
+                try:
+                    job = q.get(timeout=q_timeout)
+                    if job == _STOP_SENTINEL:
+                        # Propagar sentinel a otros workers y salir
+                        safe_put(q, _STOP_SENTINEL)
+                        break
+                except queue.Empty:
+                    continue
 
-            # Registrar job in-flight INMEDIATAMENTE tras q.get para cerrar
-            # la ventana de pérdida entre dequeue y SIGTERM.
             _inflight.job = job
 
-            # Respetar backoff de requeue manteniendo integridad del semáforo
+            # Verificar si el job sacado de la cola necesita retraso
             now = time.time()
             pa  = job.get("process_after", 0)
             if now < pa:
-                # Reencolamos sin liberar permiso. El job conserva _sem_owned = True.
-                # Para evitar busy-loop, dormimos un poco si el job que sacamos aún no está listo.
-                wait_time = min(pa - now, 2.0)
-                if wait_time > 0.1:
-                    time.sleep(wait_time)
-                
-                safe_put(q, job)
+                local_delayed_jobs.append(job)
                 _inflight.job = None
                 continue
 
-            # Limpiar flag de requeue antes de intentar procesar
             job["_requeuing"] = False
             
             try:
                 _download_one(
                     job, session, ro_conn_ref, dbq, semaphore,
-                    db_path, ro_ops_counter, rate_limiter, shared_hashes
+                    db_path, ro_ops_counter, rate_limiter, shared_hashes,
+                    shared_persisted_hashes
                 )
+                if active_downloads_count is not None:
+                    with active_downloads_count.get_lock():
+                        active_downloads_count.value -= 1
             except (TransientError, SessionExpiredError) as e:
-                # Si fallamos y vamos a reintentar, async_requeue_with_backoff marcará _requeuing=True
                 if not async_requeue_with_backoff(q, job, semaphore):
-                    # Fallo terminal: la liberación ocurrirá en el sig. bloque o finalmente
                     safe_put(dbq, {
                         "type": "DLQ", "severity": "recoverable",
                         "msg":  f"Fallo tras 3 reintentos: {e}",
                         "url":  job.get("url"), "cid": job.get("cid"),
                         "action": f"Descarga manualmente: {job.get('url')}",
                     })
+                    evaluator = ConfidenceEvaluator()
+                    ctx_fb = _build_resource_context(job, job.get("link_text") or "recurso", "", "")
+                    confidence_eval = evaluator.evaluate(
+                        ctx_fb, "", 0, job.get("url", ""),
+                        os.path.join(ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))), f"{int(job.get('seq', 1)):03d}_{_s(job.get('link_text') or 'recurso')}_FILE.url"),
+                        was_deduplicated=False, is_fallback=True
+                    )
                     save_url_reference(
                         ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))),
                         int(job.get("seq", 1)),
@@ -2168,7 +2416,12 @@ def downloader(
                         f"Fallo terminal tras 3 reintentos: {e}",
                         ctx_section=job.get("section", ""),
                         ctx_label=job.get("label_context", ""),
+                        extra={"parent_activity": job.get("parent_activity", "")},
+                        confidence_eval=confidence_eval
                     )
+                    if active_downloads_count is not None:
+                        with active_downloads_count.get_lock():
+                            active_downloads_count.value -= 1
             except DiskFullError:
                 log.critical("💀 DISCO LLENO. Worker detenido.")
                 safe_put(dbq, {
@@ -2176,19 +2429,32 @@ def downloader(
                     "url": job.get("url"), "cid": job.get("cid"),
                     "action": "Libera espacio y reinicia el crawler.",
                 })
+                if active_downloads_count is not None:
+                    with active_downloads_count.get_lock():
+                        active_downloads_count.value -= 1
                 stop_workers.set()
                 break
             except OSError as e:
                 import errno as _errno
                 if hasattr(e, "errno") and e.errno == _errno.ENOSPC:
+                    if active_downloads_count is not None:
+                        with active_downloads_count.get_lock():
+                            active_downloads_count.value -= 1
                     stop_workers.set()
                     break
-                if not async_requeue_with_backoff(q, job):
+                if not async_requeue_with_backoff(q, job, semaphore):
                     safe_put(dbq, {
                         "type": "DLQ", "severity": "critical",
                         "msg": f"OSError: {e}",
                         "url": job.get("url"), "cid": job.get("cid"),
                     })
+                    evaluator = ConfidenceEvaluator()
+                    ctx_fb = _build_resource_context(job, job.get("link_text") or "recurso", "", "")
+                    confidence_eval = evaluator.evaluate(
+                        ctx_fb, "", 0, job.get("url", ""),
+                        os.path.join(ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))), f"{int(job.get('seq', 1)):03d}_{_s(job.get('link_text') or 'recurso')}_FILE.url"),
+                        was_deduplicated=False, is_fallback=True
+                    )
                     save_url_reference(
                         ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))),
                         int(job.get("seq", 1)),
@@ -2199,7 +2465,12 @@ def downloader(
                         f"Fallo terminal OSError tras reintentos: {e}",
                         ctx_section=job.get("section", ""),
                         ctx_label=job.get("label_context", ""),
+                        extra={"parent_activity": job.get("parent_activity", "")},
+                        confidence_eval=confidence_eval
                     )
+                    if active_downloads_count is not None:
+                        with active_downloads_count.get_lock():
+                            active_downloads_count.value -= 1
             except Exception as e:
                 if not async_requeue_with_backoff(q, job, semaphore):
                     safe_put(dbq, {
@@ -2208,6 +2479,13 @@ def downloader(
                         "url": job.get("url"), "cid": job.get("cid"),
                         "action": f"Descarga manualmente: {job.get('url')}",
                     })
+                    evaluator = ConfidenceEvaluator()
+                    ctx_fb = _build_resource_context(job, job.get("link_text") or "recurso", "", "")
+                    confidence_eval = evaluator.evaluate(
+                        ctx_fb, "", 0, job.get("url", ""),
+                        os.path.join(ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))), f"{int(job.get('seq', 1)):03d}_{_s(job.get('link_text') or 'recurso')}_FILE.url"),
+                        was_deduplicated=False, is_fallback=True
+                    )
                     save_url_reference(
                         ensure(job.get("target", os.path.join(CONFIG["ROOT_DIR"], "99_Sin_Contexto"))),
                         int(job.get("seq", 1)),
@@ -2218,9 +2496,13 @@ def downloader(
                         f"Fallo terminal inesperado tras reintentos: {e}",
                         ctx_section=job.get("section", ""),
                         ctx_label=job.get("label_context", ""),
+                        extra={"parent_activity": job.get("parent_activity", "")},
+                        confidence_eval=confidence_eval
                     )
+                    if active_downloads_count is not None:
+                        with active_downloads_count.get_lock():
+                            active_downloads_count.value -= 1
             finally:
-                # Limpiar referencia in-flight siempre
                 _inflight.job = None
 
     finally:
@@ -2422,6 +2704,7 @@ def spider(
     ua: str,
     db_path: str,
     semaphore: mp.BoundedSemaphore,
+    active_downloads_count: mp.Value = None,
 ):
     """
     Worker spider. Stateless — DB es el único source of truth.
@@ -2455,8 +2738,6 @@ def spider(
     # ────────────────────────────────────────────────────────────────────────
 
     ro_conn = _open_db_ro(db_path)
-    # session eliminada de spider(): todos los extractores usan Selenium.
-    # Instanciar session aquí agotaba FDs sin propósito. (Fix v12 #3)
     visited = BoundedVisitedSet(maxsize=CONFIG["VISITED_LRU_MAXSIZE"], db_path=db_path)
 
     d             = _setup_driver(cookies)
@@ -2509,10 +2790,15 @@ def spider(
         norm = normalize_url(url)
         if norm in visited:
             return
-        rows = execute_read_safe(ro_conn, "SELECT 1 FROM visited WHERE url=?", (norm,))
+        rows = execute_read_safe(ro_conn, "SELECT status FROM visited WHERE url=?", (norm,))
         if rows:
-            visited.add(norm)
-            return
+            status = rows[0][0]
+            if status in ("completed", "failed", "manual"):
+                visited.add(norm)
+                return
+
+        # Registrar estado de procesamiento inicial
+        safe_put(dbq, {"type": "VISITED", "url": norm, "status": "processing", "cid": cid})
 
         if _should_restart_driver():
             _restart_driver()
@@ -2522,22 +2808,19 @@ def spider(
         if not _navigate_page(d, url, full_load=full_load):
             _dlq("recoverable", "No se pudo cargar la página.",
                  url, cid, f"Accede manualmente: {url}")
+            safe_put(dbq, {"type": "VISITED", "url": norm, "status": "failed", "cid": cid})
             return
 
         last_activity = time.monotonic()
         page_title    = d.title or ""
 
         if CONFIG["DOMAIN"] not in d.current_url:
-            # Marcar como visitado aunque sea externa: evita re-navegación en
-            # el mismo run si otro enlace apunta a esta misma URL. (Fix v12 #1)
             visited.add(norm)
             _dlq("manual", "Redirección a dominio externo.", url, cid,
                  "Accede manualmente con sesión institucional.")
+            safe_put(dbq, {"type": "VISITED", "url": norm, "status": "manual", "cid": cid})
             return
 
-        # Defer visited marking until AFTER successful navigation and title capture.
-        # This prevents marking pages as visited if the driver dies mid-crawl.
-        # (v12.1 Harden: Post-Extraction Visit Marking)
         pages_loaded += 1
 
         try:
@@ -2546,6 +2829,7 @@ def spider(
             _dlq("critical",
                  f"Analizador DOM falló. Recursos NO descargados. Título: {page_title}",
                  url, cid, f"Abre en Moodle: {url}")
+            safe_put(dbq, {"type": "VISITED", "url": norm, "status": "failed", "cid": cid})
             return
 
         c_dir = ensure(os.path.join(CONFIG["ROOT_DIR"], f"Curso_{cid}"))
@@ -2570,10 +2854,10 @@ def spider(
             if _is_nav_trap(u):
                 continue
 
-            title_slug = _s(section[:80])
+            title_slug = _s(section[:40])
             title_hash = hashlib.md5(
                 section.encode("utf-8", errors="replace")
-            ).hexdigest()[:4]
+            ).hexdigest()[:3]
             sec_folder = (
                 f"{sec_idx + 1:02d}_{title_slug}_{title_hash}"
                 if section and section != "00_General"
@@ -2581,7 +2865,7 @@ def spider(
             )
             target_dir = os.path.join(c_dir, sec_folder)
             if label_ctx:
-                target_dir = os.path.join(target_dir, _s(label_ctx[:60]))
+                target_dir = os.path.join(target_dir, _s(label_ctx[:40]))
 
             job_template = {
                 "cid":           cid,
@@ -2594,7 +2878,6 @@ def spider(
                 "name":          link_txt,
             }
 
-            # Procesar iframes dentro del elemento
             for i_idx, i_data in enumerate(iframes):
                 src = i_data.get("src", "")
                 if not src:
@@ -2634,7 +2917,7 @@ def spider(
             if etype in ("file", "resource") or _is_direct_download(u):
                 job = {**job_template, "url": u, "target": ensure(target_dir),
                        "resource_type": "file"}
-                _enqueue_download(dq, semaphore, job, stop_workers)
+                _enqueue_download(dq, semaphore, job, stop_workers, active_downloads_count)
 
             elif etype == "url":
                 rewritten = _rewrite_cloud_url(u)
@@ -2647,7 +2930,7 @@ def spider(
                 if rewritten != u:
                     job = {**job_template, "url": rewritten,
                            "target": ensure(target_dir), "resource_type": "external"}
-                    _enqueue_download(dq, semaphore, job, stop_workers)
+                    _enqueue_download(dq, semaphore, job, stop_workers, active_downloads_count)
 
             elif etype == "folder":
                 norm_child = normalize_url(u)
@@ -2657,7 +2940,8 @@ def spider(
                         last_activity = time.monotonic()
                         extract_folder_pages(
                             d, u, ensure(target_dir), link_txt, seq,
-                            semaphore, dq, job_template, visited, dbq, stop_workers
+                            semaphore, dq, job_template, visited, dbq, stop_workers,
+                            active_downloads_count
                         )
                         with contextlib.suppress(Exception):
                             d.back()
@@ -2671,7 +2955,8 @@ def spider(
                         last_activity = time.monotonic()
                         extract_page_content(
                             d, u, ensure(target_dir), link_txt, seq,
-                            dbq, visited, job_template, semaphore, dq, stop_workers
+                            dbq, visited, job_template, semaphore, dq, stop_workers,
+                            active_downloads_count
                         )
                         crawl(u, cid, depth + 1)
                         with contextlib.suppress(Exception):
@@ -2686,7 +2971,8 @@ def spider(
                         last_activity = time.monotonic()
                         extract_assign_content(
                             d, u, ensure(target_dir), link_txt, seq,
-                            semaphore, dq, job_template, dbq, stop_workers
+                            semaphore, dq, job_template, dbq, stop_workers,
+                            active_downloads_count
                         )
                         with contextlib.suppress(Exception):
                             d.back()
@@ -2700,7 +2986,8 @@ def spider(
                         last_activity = time.monotonic()
                         extract_forum_attachments(
                             d, u, ensure(target_dir), link_txt, seq,
-                            semaphore, dq, job_template, visited, dbq, stop_workers
+                            semaphore, dq, job_template, visited, dbq, stop_workers,
+                            active_downloads_count
                         )
                         with contextlib.suppress(Exception):
                             d.back()
@@ -2733,9 +3020,9 @@ def spider(
 
         extract_blobs_safe(d, c_dir, url, dbq)
 
-        # Ahora sí, tras extraer todo, marcamos como visitado (Garantía Zero Data Loss)
+        # Completado con éxito
         visited.add(norm)
-        safe_put(dbq, {"type": "VISITED", "url": norm, "cid": cid})
+        safe_put(dbq, {"type": "VISITED", "url": norm, "status": "completed", "cid": cid})
 
     try:
         while not stop_workers.is_set():
@@ -2747,8 +3034,6 @@ def spider(
             except queue.Empty:
                 continue
 
-            # Registrar task in-flight INMEDIATAMENTE tras q.get para cerrar
-            # la ventana de pérdida entre dequeue y SIGTERM.
             _current_task["task"] = task
             log.info("🕷️  Curso %s → %s", task.get("cid"), task.get("url"))
             try:
@@ -2763,7 +3048,6 @@ def spider(
             finally:
                 _current_task.clear()
     finally:
-        # Cierre garantizado de TODOS los recursos del proceso
         with contextlib.suppress(Exception):
             d.quit()
         with contextlib.suppress(Exception):
@@ -2923,6 +3207,91 @@ def synthesize_master_index(course_dir: str, course_id: str):
     log.info("📚 Índice maestro → %s", index_path)
 
 
+def generate_review_report(course_dir: str, course_id: str):
+    """
+    Genera 00_REVISAR_MANUALMENTE.md agrupando anomalías por prioridad.
+    """
+    report_path = os.path.join(course_dir, "00_REVISAR_MANUALMENTE.md")
+    ensure(course_dir)
+
+    anomalies = []
+    for root, _, files in os.walk(course_dir):
+        for fname in files:
+            if fname.endswith(".meta.json"):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                except Exception:
+                    continue
+                
+                rev = meta.get("revision_manual")
+                if rev and rev.get("review_required"):
+                    rel_ref = os.path.relpath(fpath[:-10], course_dir).replace("\\", "/")
+                    anomalies.append({
+                        "rel_path": rel_ref,
+                        "fname": os.path.basename(fpath[:-10]),
+                        "score": rev.get("confidence_score", 1.0),
+                        "level": rev.get("confidence_level", "high"),
+                        "reasons": rev.get("review_reasons", []),
+                        "trace": rev.get("decision_trace", ""),
+                        "url": meta.get("origen", {}).get("url", ""),
+                    })
+
+    high_priority = []
+    med_priority = []
+    low_priority = []
+
+    for a in anomalies:
+        score = a["score"]
+        if score < 0.4:
+            high_priority.append(a)
+        elif score < 0.7:
+            med_priority.append(a)
+        else:
+            low_priority.append(a)
+
+    lines = [
+        f"# 🔍 Reporte de Revisión Manual — Curso {course_id}\n\n",
+        f"> **Generado:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n",
+        f"> **Total Anomalías:** {len(anomalies)} recursos sospechosos\n\n",
+        "Este reporte clasifica todos los recursos que requieren una verificación manual "
+        "debido a inconsistencias en su tamaño, metadatos, extensiones o procedencia.\n\n---\n\n"
+    ]
+
+    def _format_anomaly_group(title, emoji, group):
+        glines = [f"## {emoji} {title} ({len(group)})\n\n"]
+        if not group:
+            glines.append("✅ Sin anomalías en esta categoría.\n\n")
+            return glines
+        for i, a in enumerate(group, 1):
+            glines.append(f"### {i}. {a['fname']}\n")
+            glines.append(f"- **Ruta Local:** `{a['rel_path']}`\n")
+            glines.append(f"- **Puntuación de Confianza:** `{a['score']}` / 1.0\n")
+            if a["url"]:
+                glines.append(f"- **Enlace de Descarga:** <{a['url']}>\n")
+            glines.append("- **Inconsistencias Detectadas:**\n")
+            for r in a["reasons"]:
+                glines.append(f"  - ⚠️ {r}\n")
+            if a["trace"]:
+                glines.append(f"- **Detalles:** *{a['trace']}*\n")
+            glines.append("\n")
+        return glines
+
+    lines.extend(_format_anomaly_group("Alta Prioridad (Requiere Atención Inmediata)", "🔴", high_priority))
+    lines.extend(_format_anomaly_group("Media Prioridad (Verificación Recomendada)", "🟡", med_priority))
+    lines.extend(_format_anomaly_group("Baja Prioridad (Revisiones Menores)", "🟢", low_priority))
+
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+            fh.flush()
+            os.fsync(fh.fileno())
+        log.info("🔍 Reporte de revisión manual → %s", report_path)
+    except Exception as e:
+        log.error("No se pudo escribir el reporte de revisión manual: %s", e)
+
+
 # ═══════════════════════════════════════════════════════════════
 # §21 — GRACEFUL SHUTDOWN (anti-zombie, anti-deadlock)
 # ═══════════════════════════════════════════════════════════════
@@ -3070,6 +3439,7 @@ def _graceful_shutdown(
         if os.path.isdir(c_dir):
             flush_dlq_to_human_report(c_dir, cid)
             synthesize_master_index(c_dir, cid)
+            generate_review_report(c_dir, cid)
 
     _check_emergency_files()
     log.info("✅  Shutdown completado.")
@@ -3137,13 +3507,24 @@ def main():
 
     log.info("📚 %d cursos en cola.", len(courses))
 
-    log.info("📚 %d cursos en cola.", len(courses))
+    active_downloads_count = mp.Value('i', 0)
 
-    # Reingestión centralizada de trabajos rescatados de runs anteriores
-    reingest_emergency_data(dl_q, spider_q, db_q, semaphore)
+    # Reingestión centralizada en hilo de background para no bloquear el inicio
+    reingestion_thread = threading.Thread(
+        target=reingest_emergency_data_worker,
+        args=(dl_q, spider_q, db_q, semaphore, active_downloads_count, stop_workers),
+        name="Reingestion-Thread",
+        daemon=True
+    )
+    reingestion_thread.start()
+
+    # Manager para estado compartido ultra-rápido (deduplicación sin ventana y compromiso SQLite)
+    manager = mp.Manager()
+    shared_hashes = manager.dict()
+    shared_persisted_hashes = manager.dict()
 
     dbp = mp.Process(
-        target=db_daemon, args=(db_q, db_path, stop_db),
+        target=db_daemon, args=(db_q, db_path, stop_db, shared_persisted_hashes),
         name="DB-Daemon", daemon=False
     )
     dbp.start()
@@ -3152,20 +3533,18 @@ def main():
         mp.Process(
             target=spider,
             args=(spider_q, dl_q, db_q, stop_workers,
-                  cookies, ua, db_path, semaphore),
+                  cookies, ua, db_path, semaphore, active_downloads_count),
             name=f"Spider-{i + 1}"
         )
         for i in range(CONFIG["SPIDERS"])
     ]
-    # Manager para estado compartido ultra-rápido (deduplicación sin ventana)
-    manager = mp.Manager()
-    shared_hashes = manager.dict()
 
     downs = [
         mp.Process(
             target=downloader,
             args=(dl_q, db_q, stop_workers,
-                  cookies, ua, db_path, semaphore, shared_hashes),
+                  cookies, ua, db_path, semaphore, shared_hashes,
+                  shared_persisted_hashes, active_downloads_count),
             name=f"DL-{i + 1}"
         )
         for i in range(CONFIG["DOWNLOADERS"])
@@ -3179,14 +3558,24 @@ def main():
         spider_q=spider_q, dl_q=dl_q, db_q=db_q,
         spiders=spiders, downs=downs, dbp=dbp,
         courses=courses, semaphore=semaphore,
+        active_downloads_count=active_downloads_count,
     )
     signal.signal(signal.SIGINT,  shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
     # Esperar spiders con timeout seguro
     _join_with_timeout(spiders)
-    log.info("Spiders finalizados. Enviando sentinels a downloaders...")
 
+    # Esperar descargas activas antes de enviar sentinels
+    log.info("Spiders finalizados. Esperando descargas activas (%d en curso/cola)...", active_downloads_count.value)
+    t0 = time.monotonic()
+    while active_downloads_count.value > 0 and not stop_workers.is_set():
+        time.sleep(0.2)
+        if time.monotonic() - t0 > 1800:  # 30 minutos límite
+            log.warning("Timeout superado esperando a que terminen las descargas.")
+            break
+
+    log.info("Descargas finalizadas. Enviando sentinels a downloaders...")
     # Shutdown ordenado con sentinels
     for _ in range(CONFIG["DOWNLOADERS"]):
         dl_q.put(_STOP_SENTINEL)
@@ -3214,6 +3603,7 @@ def main():
         if os.path.isdir(c_dir):
             flush_dlq_to_human_report(c_dir, cid)
             synthesize_master_index(c_dir, cid)
+            generate_review_report(c_dir, cid)
 
     _check_emergency_files()
 
