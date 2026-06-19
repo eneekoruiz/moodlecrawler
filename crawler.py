@@ -71,11 +71,14 @@ import functools
 import threading
 import multiprocessing as mp
 import logging
+from dotenv import load_dotenv  # <--- AÑADE ESTO AQUÍ
+
+load_dotenv()
 
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, unquote
 from email.utils import decode_rfc2231
 
@@ -140,7 +143,7 @@ CONFIG = {
     "JOIN_TIMEOUT_S":         60,
     "MAX_LABEL_PROPAGATION":  25,
     "FULL_LOAD_MODULES":      frozenset({
-        "/mod/page/", "/mod/book/", "/mod/assign/",
+        "/course/view.php", "/mod/page/", "/mod/book/", "/mod/assign/",
         "/mod/forum/", "/mod/wiki/",
     }),
     "EXTERNAL_SAVE_DOMAINS":  frozenset({
@@ -207,6 +210,229 @@ TAG_STOPWORDS = frozenset({
 
 
 # ═══════════════════════════════════════════════════════════════
+# AgentDebugger
+# ═══════════════════════════════════════════════════════════════
+
+class AgentDebugger:
+    def __init__(self, driver: webdriver.Chrome):
+        self.driver = driver
+
+    def capture_context(self, step_name: str) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            folder = "agent_context"
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+            
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            safe_step_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in step_name)
+            base_filename = f"{timestamp}_{safe_step_name}"
+            
+            # Captura de pantalla
+            screenshot_path = os.path.join(folder, f"{base_filename}.png")
+            self.driver.save_screenshot(screenshot_path)
+            
+            # Guardar código fuente DOM
+            html_path = os.path.join(folder, f"{base_filename}.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+                
+            log.info("📸 Contexto del agente guardado: screenshot=%s, HTML=%s", screenshot_path, html_path)
+            return screenshot_path, html_path
+        except Exception as e:
+            log.error("Error al guardar el contexto del agente: %s", e)
+            return None, None
+
+    def alert_and_wait(self, error_msg: str, step_name: str):
+        log.warning("⚠️ Alerta de Agente en el paso '%s': %s", step_name, error_msg)
+        screenshot_path, html_path = self.capture_context(step_name)
+        
+        # Alerta visual llamativa
+        print("\n" + "!" * 85)
+        print(f"⚠️  ALERTA DE AGENTE - PASO FALLIDO: {step_name.upper()}")
+        print(f"❌  ERROR DETECTADO: {error_msg}")
+        if screenshot_path and html_path:
+            print("📸  CAPTURAS DE DIAGNÓSTICO GUARDADAS EN:")
+            print(f"    - Captura: {os.path.abspath(screenshot_path)}")
+            print(f"    - Código DOM:  {os.path.abspath(html_path)}")
+        print("!" * 85 + "\n")
+        
+        # Human-in-the-loop: pausar sin cerrar el driver ni propagar la excepción
+        input("⚠️  Agente atascado. Revisa el navegador/capturas. Arregla el problema en la ventana y pulsa ENTER para reintentar/continuar: ")
+
+    def dump_diagnostics(self, course_id: str, page_type: str) -> str:
+        try:
+            folder = os.path.join("agent_context", "diagnostics", str(course_id))
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            page_folder = os.path.join(folder, f"{timestamp}_{page_type}")
+            if not os.path.exists(page_folder):
+                os.makedirs(page_folder)
+            
+            # 1. Raw HTML page source
+            html_path = os.path.join(page_folder, "00_PAGE_SOURCE.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+                
+            # 2. Simplified DOM
+            dom_js = """
+            function getSimplifiedDOM(root) {
+              let lines = [];
+              function walk(node, depth) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                  const tagName = node.tagName.toLowerCase();
+                  if (['script', 'style', 'head', 'noscript', 'meta', 'link', 'svg', 'path'].includes(tagName)) {
+                    return;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (style.display === 'none' || style.visibility === 'hidden') {
+                    return;
+                  }
+                  const id = node.id ? '#' + node.id : '';
+                  const cls = node.className && typeof node.className === 'string' ? '.' + node.className.trim().replace(/\\\\s+/g, '.') : '';
+                  let text = '';
+                  let child = node.firstChild;
+                  while (child) {
+                    if (child.nodeType === Node.TEXT_NODE) {
+                      text += child.nodeValue.trim();
+                    }
+                    child = child.nextSibling;
+                  }
+                  const href = node.getAttribute('href') ? ` [href="${node.getAttribute('href')}"]` : '';
+                  const textSnippet = text ? ` "${text.substring(0, 50)}"` : '';
+                  lines.push('  '.repeat(depth) + `<${tagName}${id}${cls}${href}>${textSnippet}`);
+                  for (let i = 0; i < node.childNodes.length; i++) {
+                    walk(node.childNodes[i], depth + 1);
+                  }
+                }
+              }
+              walk(root || document.body, 0);
+              return lines.join('\\\\n');
+            }
+            return getSimplifiedDOM();
+            """
+            simplified_dom = self.driver.execute_script(dom_js)
+            dom_path = os.path.join(page_folder, "00_DOM_SIMPLIFICADO.txt")
+            with open(dom_path, "w", encoding="utf-8") as f:
+                f.write(simplified_dom)
+                
+            # 3. Links found
+            links_js = """
+            return Array.from(document.querySelectorAll('a[href]')).map(a => ({
+              text: (a.innerText || '').trim(),
+              href: a.getAttribute('href'),
+              class: a.className,
+              visible: a.offsetWidth > 0 && a.offsetHeight > 0
+            }));
+            """
+            links = self.driver.execute_script(links_js)
+            links_path = os.path.join(page_folder, "00_ENLACES_ENCONTRADOS.txt")
+            with open(links_path, "w", encoding="utf-8") as f:
+                for lnk in links:
+                    vis_str = "[VISIBLE]" if lnk['visible'] else "[OCULTO]"
+                    f.write(f"{vis_str} {lnk['text']} -> {lnk['href']} (class: {lnk['class']})\\n")
+            
+            # 4. Metadata
+            meta = {
+                "course_id": course_id,
+                "page_type": page_type,
+                "url": self.driver.current_url,
+                "title": self.driver.title,
+                "timestamp": timestamp,
+            }
+            meta_path = os.path.join(page_folder, "00_METADATOS.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+                
+            log.info("📊 Diagnósticos de página volcados en: %s", page_folder)
+            return page_folder
+        except Exception as e:
+            log.error("Error al volcar diagnósticos de página: %s", e)
+            return ""
+
+
+class CourseTree:
+    def __init__(self, course_name: str, course_id: str):
+        self.root = {
+            "name": course_name,
+            "type": "course",
+            "url": f"https://egela.ehu.eus/course/view.php?id={course_id}",
+            "children": [],
+            "metadata": {}
+        }
+
+    def add_node(self, path: List[str], node_name: str, node_type: str, url: str = "", metadata: dict = None) -> dict:
+        """
+        Adds a node to the tree at the given hierarchical path.
+        path: List of parent names, e.g. ["Tema 1: Matrices", "Lecturas"]
+        """
+        current = self.root
+        
+        # Traverse path, creating intermediate folder/section nodes if needed
+        for segment in path:
+            found = None
+            for child in current["children"]:
+                if child["name"] == segment:
+                    found = child
+                    break
+            if not found:
+                found = {
+                    "name": segment,
+                    "type": "section" if current["type"] == "course" else "label",
+                    "url": "",
+                    "children": [],
+                    "metadata": {}
+                }
+                current["children"].append(found)
+            current = found
+            
+        # Add the leaf node or sub-resource
+        for child in current["children"]:
+            if child["name"] == node_name and child["type"] == node_type:
+                if url:
+                    child["url"] = url
+                if metadata:
+                    child["metadata"].update(metadata)
+                return child
+                
+        new_node = {
+            "name": node_name,
+            "type": node_type,
+            "url": url,
+            "children": [],
+            "metadata": metadata or {}
+        }
+        current["children"].append(new_node)
+        return new_node
+
+    def to_ascii_tree(self) -> str:
+        lines = []
+        def walk(node, prefix="", is_last=True):
+            if node["type"] == "course":
+                lines.append(f"🎓 Curso: {node['name']}")
+            else:
+                marker = "└── " if is_last else "├── "
+                node_info = f" ({node['type'].upper()})" if node['type'] not in ("section", "label") else ""
+                lines.append(f"{prefix}{marker}{node['name']}{node_info}")
+                
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            child_count = len(node["children"])
+            for i, child in enumerate(node["children"]):
+                walk(child, child_prefix, i == child_count - 1)
+        walk(self.root)
+        return "\n".join(lines)
+
+    def save_to_files(self, target_dir: str):
+        # 1. Save TXT tree
+        txt_path = os.path.join(target_dir, "00_ESTRUCTURA_CURSO.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(self.to_ascii_tree())
+            
+        # 2. Save JSON tree
+        json_path = os.path.join(target_dir, "00_ESTRUCTURA_CURSO.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(self.root, f, indent=2, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
 # §2 — EXCEPCIONES TIPADAS
 # ═══════════════════════════════════════════════════════════════
 
@@ -246,6 +472,7 @@ class ResourceContext:
     resource_type:      str = "file"
     context_confidence: str = "unknown"
     extra_meta:         dict = field(default_factory=dict)
+    hierarchy:          Optional[List[str]] = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -440,9 +667,10 @@ class ConfidenceEvaluator:
 
         # Sección ambigua o genérica
         if not ctx.section_title or any(kw in ctx.section_title.lower() for kw in ("general", "tema", "sección", "seccion", "modulo", "unidad")):
-            if ctx.section_title == "00_General" or not ctx.section_title:
-                score -= 0.3
-                reasons.append("sección ambigua o genérica")
+            # Si no tiene etiqueta visual ni actividad padre para aportar contexto semántico
+            if not ctx.label_context and not ctx.parent_activity:
+                score -= 0.2
+                reasons.append("sección ambigua o genérica sin contexto adicional")
 
         # Label propagado con baja confianza
         if ctx.label_context and len(ctx.label_context) > CONFIG["MAX_LABEL_PROPAGATION"]:
@@ -450,7 +678,7 @@ class ConfidenceEvaluator:
             reasons.append("label propagado con baja confianza")
 
         # Título vacío o genérico
-        if not ctx.link_text or ctx.link_text.strip().lower() in ("recurso", "descarga", "archivo", "file", "document", "click aquí", "enlace"):
+        if not ctx.link_text or ctx.link_text.strip().lower() in ("recurso", "descarga", "archivo", "file", "document", "click aquí", "enlace", "view", "descargar"):
             score -= 0.3
             reasons.append("título vacío o genérico")
 
@@ -539,13 +767,44 @@ class EvidenceBasedClassifier:
     """
 
     def classify(self, ctx: ResourceContext, course_dir: str) -> tuple:
-        if ctx.section_title and ctx.section_title not in ("00_General", ""):
+        if ctx.hierarchy:
+            cleaned_segments = []
+            for i, segment in enumerate(ctx.hierarchy):
+                if i == 0 and ctx.section_title and segment == ctx.section_title:
+                    title_slug = _s(segment[:40])
+                    title_hash = hashlib.md5(
+                        segment.encode("utf-8", errors="replace")
+                    ).hexdigest()[:3]
+                    cleaned_segments.append(f"{ctx.section_index + 1:02d}_{title_slug}_{title_hash}")
+                else:
+                    cleaned_segments.append(_s(segment[:40]))
+            if ctx.parent_activity and _s(ctx.parent_activity[:35]) not in cleaned_segments:
+                cleaned_segments.append(_s(ctx.parent_activity[:35]))
+            base = os.path.join(course_dir, *cleaned_segments)
+            ctx.context_confidence = "high"
+            return ensure(base), "high"
+
+        # Clasificar secciones de forma más semántica e inclusiva
+        if ctx.section_title and ctx.section_title != "":
             title_slug = _s(ctx.section_title[:40])
             title_hash = hashlib.md5(
                 ctx.section_title.encode("utf-8", errors="replace")
             ).hexdigest()[:3]
             sec_folder = f"{ctx.section_index + 1:02d}_{title_slug}_{title_hash}"
             confidence = "high"
+        elif ctx.extra_meta and ctx.extra_meta.get("breadcrumbs"):
+            # Intentar clasificar usando breadcrumbs visuales
+            bc = ctx.extra_meta["breadcrumbs"]
+            parts = [p.strip() for p in bc.split(">") if p.strip()]
+            if len(parts) > 1:
+                candidate = parts[-1]
+                title_slug = _s(candidate[:40])
+                title_hash = hashlib.md5(candidate.encode("utf-8", errors="replace")).hexdigest()[:3]
+                sec_folder = f"01_{title_slug}_{title_hash}"
+                confidence = "partial"
+            else:
+                sec_folder = "99_Sin_Contexto"
+                confidence = "unknown"
         else:
             sec_folder = "99_Sin_Contexto"
             confidence = "unknown"
@@ -555,7 +814,8 @@ class EvidenceBasedClassifier:
         if ctx.label_context and ctx.label_context.strip():
             base = os.path.join(base, _s(ctx.label_context[:35]))
         elif confidence == "high":
-            confidence = "partial"
+            # Si no hay etiqueta pero la sección es fuerte, mantenemos high
+            pass
 
         if ctx.parent_activity:
             base = os.path.join(base, _s(ctx.parent_activity[:35]))
@@ -567,7 +827,12 @@ class EvidenceBasedClassifier:
 class StructuredNamer:
     def build_filename(self, ctx: ResourceContext, ext: str) -> str:
         parts = [f"{ctx.visual_seq:03d}"]
-        link_slug   = _s(ctx.link_text[:50])   if ctx.link_text   else ""
+        
+        # Detectar si el texto del enlace es genérico
+        raw_link = ctx.link_text.strip().lower() if ctx.link_text else ""
+        is_generic_link = raw_link in ("", "view", "click_here", "download", "archivo", "recurso", "file", "enlace", "documento", "descarga", "descargar")
+        
+        link_slug   = _s(ctx.link_text[:50])   if (ctx.link_text and not is_generic_link) else ""
         server_slug = _s(os.path.splitext(ctx.server_filename or "")[0][:40])
         parent_slug = _s(ctx.parent_activity[:30]) if ctx.parent_activity else ""
 
@@ -677,6 +942,7 @@ def _build_resource_context(
         file_hash       = file_hash,
         resource_type   = job.get("resource_type", "file"),
         extra_meta      = job.get("extra_meta", {}),
+        hierarchy       = job.get("hierarchy"),
     )
 
 
@@ -1592,6 +1858,9 @@ def extract_page_content(
     dl_q: mp.Queue,
     stop_workers: mp.Event,
     active_downloads_count: mp.Value = None,
+    debugger: Optional['AgentDebugger'] = None,
+    current_tree: Optional['CourseTree'] = None,
+    parent_path: Optional[List[str]] = None,
 ) -> int:
     """
     Extrae contenido de mod/page y mod/book.
@@ -1600,14 +1869,19 @@ def extract_page_content(
     ensure(target_dir)
     found = 0
 
-    try:
-        WebDriverWait(d, 10).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".box.generalbox, #region-main")
+    while True:
+        try:
+            WebDriverWait(d, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, ".box.generalbox, #region-main")
+                )
             )
-        )
-    except TimeoutException:
-        pass
+            break
+        except TimeoutException as e:
+            if debugger and CONFIG.get("AGENT_MODE", False):
+                debugger.alert_and_wait(f"Timeout esperando contenido en página: {e}", f"Esperar contenido de página {name}")
+                continue
+            break
 
     # Guardar HTML completo SIEMPRE (preservación offline)
     html_fname = f"{seq:03d}_{_s(name[:50])}_PAGINA.html"
@@ -1621,6 +1895,8 @@ def extract_page_content(
             fh.write(f"<!-- Capturado: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} -->\n")
             fh.write(page_html)
         log.info("🌐 HTML guardado: %s", html_fname)
+        if current_tree and parent_path:
+            current_tree.add_node(parent_path, html_fname, "page_html", url=page_url)
     except Exception as e:
         log.debug("Error guardando HTML de página %s: %s", page_url, e)
 
@@ -1636,13 +1912,17 @@ def extract_page_content(
                 if _is_nav_trap(href):
                     continue
                 if _is_direct_download(href):
+                    if current_tree and parent_path:
+                        current_tree.add_node(parent_path, link_name, "file", url=href)
                     job = {**job_template, "url": href,
                            "link_text": link_name, "name": link_name,
                            "target": target_dir, "resource_type": "file",
-                           "parent_activity": name}
+                           "parent_activity": name, "hierarchy": parent_path}
                     if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
                         found += 1
                 elif _is_external_save_domain(href):
+                    if current_tree and parent_path:
+                        current_tree.add_node(parent_path, link_name, "external_url", url=href)
                     save_url_reference(
                         target_dir, seq + found, link_name, href, page_url,
                         "external_in_page", "Enlace externo dentro de página Moodle",
@@ -1663,6 +1943,8 @@ def extract_page_content(
                    iframe.get_attribute("data-url") or "")
             if not src or src.startswith("about:"):
                 continue
+            if current_tree and parent_path:
+                current_tree.add_node(parent_path, f"iframe_{i + 1}", "iframe", url=src)
             save_url_reference(
                 target_dir, seq + found + i, f"iframe_{i + 1}", src, page_url,
                 "iframe", "Contenido embebido en iframe",
@@ -1677,6 +1959,85 @@ def extract_page_content(
     return found
 
 
+
+def extract_book_content(
+    d: webdriver.Chrome,
+    book_url: str,
+    target_dir: str,
+    name: str,
+    seq: int,
+    semaphore: mp.BoundedSemaphore,
+    dl_q: mp.Queue,
+    job_template: dict,
+    visited: BoundedVisitedSet,
+    dbq: mp.Queue,
+    stop_workers: mp.Event,
+    active_downloads_count: mp.Value = None,
+    debugger: Optional['AgentDebugger'] = None,
+    current_tree: Optional['CourseTree'] = None,
+    parent_path: Optional[List[str]] = None,
+) -> int:
+    """Extrae todos los capítulos de un Libro de Moodle recursivamente."""
+    book_dir = os.path.join(target_dir, f"{seq:03d}_LIBRO_{_s(name[:50])}")
+    ensure(book_dir)
+    found = 0
+    
+    chapter_urls = []
+    try:
+        toc_links = d.find_elements(By.CSS_SELECTOR, ".booktoc a[href], .block_book_toc a[href]")
+        for a in toc_links:
+            href = a.get_attribute("href") or ""
+            if href and "chapterid=" in href and href not in chapter_urls:
+                chapter_urls.append(href)
+    except Exception:
+        pass
+    
+    if not chapter_urls:
+        chapter_urls = [book_url]
+    
+    for idx, chap_url in enumerate(chapter_urls):
+        while True:
+            try:
+                if d.current_url != chap_url:
+                    d.get(chap_url)
+                    time.sleep(1.0)
+                
+                chap_title = d.title or f"Capitulo_{idx + 1}"
+                chap_html = d.execute_script(
+                    "var el = document.getElementById('region-main') || document.body;"
+                    "return el ? el.innerHTML : '';"
+                )
+                if chap_html:
+                    fname = f"{(idx + 1):02d}_{_s(chap_title[:50])}.html"
+                    with open(os.path.join(book_dir, fname), "w", encoding="utf-8") as fh:
+                        fh.write(f"<!-- Libro: {name} | Origen: {chap_url} -->\n{chap_html}")
+                    if current_tree and parent_path:
+                        # Append the book activity name to get the book's sub-path
+                        book_path = parent_path + [name]
+                        current_tree.add_node(book_path, fname, "chapter_html", url=chap_url)
+                
+                for a in d.find_elements(By.CSS_SELECTOR, "#region-main a[href*='pluginfile'], a[href*='forcedownload']"):
+                    href = a.get_attribute("href") or ""
+                    aname = (a.text or a.get_attribute("title") or f"adjunto_cap_{idx + 1}_{found + 1}").strip()
+                    if not href or any(p in href for p in ("/user/icon/", "/theme/image.php", "pix/u/")):
+                        continue
+                    book_path = parent_path + [name] if parent_path else []
+                    if current_tree and book_path:
+                        current_tree.add_node(book_path, aname, "file", url=href)
+                    job = {**job_template, "url": href, "link_text": aname, "name": aname,
+                           "target": book_dir, "resource_type": "file", "parent_activity": name,
+                           "hierarchy": book_path}
+                    if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
+                        found += 1
+                break
+            except Exception as e:
+                if debugger and CONFIG.get("AGENT_MODE", False):
+                    debugger.alert_and_wait(f"Error procesando capítulo {idx+1}: {e}", f"Procesar libro {name} cap {idx+1}")
+                    continue
+                break
+
+    return found
+
 def extract_assign_content(
     d: webdriver.Chrome,
     assign_url: str,
@@ -1689,6 +2050,9 @@ def extract_assign_content(
     dbq: mp.Queue,
     stop_workers: mp.Event,
     active_downloads_count: mp.Value = None,
+    debugger: Optional['AgentDebugger'] = None,
+    current_tree: Optional['CourseTree'] = None,
+    parent_path: Optional[List[str]] = None,
 ) -> int:
     """
     Extrae materiales de apoyo de mod/assign (enunciados, plantillas, adjuntos).
@@ -1706,29 +2070,44 @@ def extract_assign_content(
         if html:
             with open(os.path.join(target_dir, html_fname), "w", encoding="utf-8") as fh:
                 fh.write(f"<!-- Tarea: {name} | Origen: {assign_url} -->\n{html}")
-    except Exception:
+            if current_tree and parent_path:
+                assign_path = parent_path + [name]
+                current_tree.add_node(assign_path, html_fname, "assign_html", url=assign_url)
+    except Exception as e:
+        if isinstance(e, (WebDriverException, TimeoutException)):
+            raise
         pass
 
     try:
         anchors = d.find_elements(
             By.CSS_SELECTOR,
-            ".box.generalbox a[href*='pluginfile'],"
-            "#intro a[href*='pluginfile'],"
-            ".description a[href*='pluginfile'],"
-            "a[href*='forcedownload']"
+            "#region-main a[href*='pluginfile'], a[href*='forcedownload']"
         )
         for a in anchors:
-            href  = a.get_attribute("href") or ""
-            aname = (a.text or a.get_attribute("title") or f"adjunto_{found + 1}").strip()
-            if not href:
+            try:
+                href  = a.get_attribute("href") or ""
+                aname = (a.text or a.get_attribute("title") or f"adjunto_{found + 1}").strip()
+                if not href:
+                    continue
+                # Filtrar iconos de sistema, avatares e imagenes de tema
+                if any(p in href for p in ("/user/icon/", "/theme/image.php", "pix/u/", "pix/f/")):
+                    continue
+                assign_path = parent_path + [name] if parent_path else []
+                if current_tree and assign_path:
+                    current_tree.add_node(assign_path, aname, "file", url=href)
+                job = {**job_template, "url": href,
+                       "link_text": aname, "name": aname,
+                       "target": target_dir, "resource_type": "file",
+                       "parent_activity": name, "hierarchy": assign_path}
+                if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
+                    found += 1
+            except Exception as e:
+                if isinstance(e, (WebDriverException, TimeoutException)):
+                    raise
                 continue
-            job = {**job_template, "url": href,
-                   "link_text": aname, "name": aname,
-                   "target": target_dir, "resource_type": "file",
-                   "parent_activity": name}
-            if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
-                found += 1
-    except Exception:
+    except Exception as e:
+        if isinstance(e, (WebDriverException, TimeoutException)):
+            raise
         pass
 
     return found
@@ -1747,6 +2126,9 @@ def extract_forum_attachments(
     dbq: mp.Queue,
     stop_workers: mp.Event,
     active_downloads_count: mp.Value = None,
+    debugger: Optional['AgentDebugger'] = None,
+    current_tree: Optional['CourseTree'] = None,
+    parent_path: Optional[List[str]] = None,
 ) -> int:
     """Navega hilos del foro y extrae adjuntos. Máximo 20 hilos."""
     ensure(target_dir)
@@ -1766,6 +2148,26 @@ def extract_forum_attachments(
             try:
                 d.get(thread_url)
                 time.sleep(1.0)
+                
+                # Guardar el HTML completo de la discusión para preservación offline
+                try:
+                    disc_title = d.title or f"discusion_{found + 1}"
+                    disc_html = d.execute_script(
+                        "var el = document.getElementById('region-main') || document.body;"
+                        "return el ? el.innerHTML : '';"
+                    )
+                    if disc_html:
+                        disc_fname = f"{seq + found:03d}_{_s(name[:30])}_{_s(disc_title[:30])}_DISCUSION.html"
+                        with open(os.path.join(target_dir, disc_fname), "w", encoding="utf-8") as fh:
+                            fh.write(f"<!-- Foro: {name} | Origen: {thread_url} -->\n{disc_html}")
+                        if current_tree and parent_path:
+                            forum_path = parent_path + [name]
+                            current_tree.add_node(forum_path, disc_fname, "forum_discussion_html", url=thread_url)
+                except Exception as de:
+                    if isinstance(de, (WebDriverException, TimeoutException)):
+                        raise
+                    log.debug("Error al guardar HTML de discusion del foro: %s", de)
+
                 for a in d.find_elements(
                     By.CSS_SELECTOR, "a[href*='pluginfile'], a[href*='forcedownload']"
                 ):
@@ -1773,15 +2175,24 @@ def extract_forum_attachments(
                     aname = (a.text or f"adjunto_foro_{found + 1}").strip()
                     if not href:
                         continue
+                    if any(p in href for p in ("/user/icon/", "/theme/image.php", "pix/u/", "pix/f/")):
+                        continue
+                    forum_path = parent_path + [name] if parent_path else []
+                    if current_tree and forum_path:
+                        current_tree.add_node(forum_path, aname, "file", url=href)
                     job = {**job_template, "url": href,
                            "link_text": aname, "name": aname,
                            "target": target_dir, "resource_type": "file",
-                           "parent_activity": name}
+                           "parent_activity": name, "hierarchy": forum_path}
                     if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
                         found += 1
-            except Exception:
+            except Exception as e:
+                if isinstance(e, (WebDriverException, TimeoutException)):
+                    raise
                 continue
     except Exception as e:
+        if isinstance(e, (WebDriverException, TimeoutException)):
+            raise
         log.warning("Error en extract_forum_attachments: %s", e)
 
     return found
@@ -1800,6 +2211,9 @@ def extract_folder_pages(
     dbq: mp.Queue,
     stop_workers: mp.Event,
     active_downloads_count: mp.Value = None,
+    debugger: Optional['AgentDebugger'] = None,
+    current_tree: Optional['CourseTree'] = None,
+    parent_path: Optional[List[str]] = None,
 ) -> int:
     """
     Navega TODAS las páginas de un mod/folder con paginación.
@@ -1829,10 +2243,12 @@ def extract_folder_pages(
                 aname = (a.text or f"archivo_{found + 1}").strip()
                 if not href:
                     continue
+                if current_tree and parent_path:
+                    current_tree.add_node(parent_path, aname, "file", url=href)
                 job = {**job_template, "url": href,
                        "link_text": aname, "name": aname,
                        "target": target_dir, "resource_type": "file",
-                       "parent_activity": name}
+                       "parent_activity": name, "hierarchy": parent_path}
                 if _enqueue_download(dl_q, semaphore, job, stop_workers, active_downloads_count):
                     found += 1
 
@@ -1848,6 +2264,8 @@ def extract_folder_pages(
                     break
 
         except Exception as e:
+            if isinstance(e, (WebDriverException, TimeoutException)):
+                raise
             log.warning("Error en extract_folder_pages %s: %s", current_url, e)
             break
 
@@ -2069,8 +2487,14 @@ def _download_one(
             ctype   = r.headers.get("Content-Type", "").lower()
             preview = b""
 
+            is_external = job.get("resource_type") == "external"
             if "text/html" in ctype:
                 preview = r.raw.read(4096, decode_content=True)
+                if is_external:
+                    # Enlace externo normal que apunta a una página web. Guardamos como acceso directo .url.
+                    _save_fallback_reference("Enlace externo (HTML)", resource_type="external_url")
+                    return
+
                 if not _is_direct_download(job.get("url", "")):
                     is_login_html = any(sig in preview.lower() for sig in _HTML_BAD_SIGS)
                     if is_login_html:
@@ -2531,120 +2955,279 @@ _JS_MAP_UNIVERSAL = """
   const MAX_LABEL_PROP = """ + str(CONFIG["MAX_LABEL_PROPAGATION"]) + """;
   let seq=1;
 
-  const sSecSel=[
-    '[data-for="section"]','[data-sectionid]',
-    'li.section.main','div.section.main','.course-section',
-    '.grid-section','.tile','.onetopic-tab-content',
-    '.course-content-item','[data-type="section"]',
-    '.section-item','.section.main','[id^="section-"]'
-  ];
-  const sActSel=[
-    '[data-for="cmitem"]','li.activity','div.activity','div.activity-item',
-    '.activity-item','[data-activityname]','.mod-indent-outer',
-    '.activity-wrapper','.activity-instance'
-  ];
+  // Extraer breadcrumbs globales del curso/sitio para mayor contexto
+  const breadcrumbs = Array.from(document.querySelectorAll('.breadcrumb-item, .breadcrumb a, .breadcrumbs a'))
+    .map(e => (e.innerText || e.textContent || '').trim())
+    .filter(Boolean)
+    .join(' > ');
 
-  let sections=[];
-  for(const s of sSecSel){
-    sections=Array.from(document.querySelectorAll(s));
-    if(sections.length>0) break;
-  }
-  if(sections.length===0){
-    const m=document.getElementById('region-main')||document.querySelector('main');
-    if(m) sections=[m];
+  // Encontrar todas las secciones
+  let sections = Array.from(document.querySelectorAll('[data-for="section"], [data-sectionid], li.section.main, div.section.main, .course-section, .onetopic-tab-content, .section'));
+  if (sections.length === 0) {
+    const mainArea = document.getElementById('region-main') || document.querySelector('main') || document.body;
+    sections = mainArea ? [mainArea] : [];
   }
 
-  sections.forEach((sec,sec_idx)=>{
-    const tSelectors=[
-      'h3.sectionname','h2.sectionname',
-      '[data-for="sectiontitle"]','.section-title h3','.section-title h2',
-      '.grid-section-title','.tile-title','.onetopic-tab-title','h1','h2','h3','h4',
-    ];
-    let title='';
-    for(const sel of tSelectors){
-      const el=sec.querySelector(sel);
-      if(el){ title=(el.innerText||'').trim().split('\\n')[0]; if(title) break; }
+  sections.forEach((sec, sec_idx) => {
+    // 1. Obtener título de sección
+    let title = '';
+    const heading = sec.querySelector('h3, h2, [data-for="sectiontitle"], .section-title, .sectionname');
+    if (heading) {
+      title = (heading.innerText || heading.textContent || '').trim().split('\\n')[0];
     }
-    if(!title) title=sec.getAttribute('aria-label')||sec.getAttribute('title')||'';
-    if(title&&title.length>1){
-      current_section=title; current_section_idx=sec_idx;
-      current_label=null; label_resource_count=0; seq=1;
+    if (!title) {
+      title = sec.getAttribute('aria-label') || sec.getAttribute('title') || '';
+    }
+    if (title && title.length > 1) {
+      current_section = title;
+      current_section_idx = sec_idx;
+      current_label = null;
+      label_resource_count = 0;
+      seq = 1;
     }
 
-    let acts=[];
-    for(const s of sActSel){ acts=Array.from(sec.querySelectorAll(s)); if(acts.length>0) break; }
-    if(acts.length===0)
-      acts=Array.from(sec.querySelectorAll('a[href]')).map(a=>a.parentElement||a);
+    // 2. Escaneo secuencial del DOM interno para reconstruir la jerarquía
+    const walker = document.createTreeWalker(sec, NodeFilter.SHOW_ELEMENT, {
+      acceptNode: function(node) {
+        const tagName = node.tagName.toLowerCase();
+        const cls = node.className || '';
+        
+        if (cls.includes('action-menu') || cls.includes('actions') || cls.includes('dropdown')) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        
+        if (cls.includes('activity') || cls.includes('activity-item') || node.hasAttribute('data-activityname') || cls.includes('modtype_label') || tagName === 'h4' || tagName === 'h5') {
+          return NodeFilter.FILTER_ACCEPT;
+        }
+        if (tagName === 'a' && node.getAttribute('href')) {
+          const href = node.getAttribute('href');
+          if (href.includes('/mod/') || href.includes('pluginfile') || href.includes('forcedownload')) {
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        }
+        return NodeFilter.FILTER_SKIP;
+      }
+    });
 
-    for(const act of acts){
-      const st=window.getComputedStyle(act);
-      if(st.display==='none'||st.visibility==='hidden') continue;
-      const rc=act.getBoundingClientRect();
-      if(rc.width===0&&rc.height===0) continue;
-      if(rc.right<-200||rc.bottom<-200) continue;
-
-      const cls=act.getAttribute('class')||'';
-      const isLabel=cls.includes('modtype_label')||
-                     act.getAttribute('data-type')==='label'||
-                     act.getAttribute('data-for')==='label';
-      if(isLabel){
-        const lt=(act.innerText||act.textContent||'').trim().split('\\n')[0];
-        if(lt&&lt.length>2&&lt.length<200){ current_label=lt; label_resource_count=0; }
+    let node;
+    while (node = walker.nextNode()) {
+      const tagName = node.tagName.toLowerCase();
+      const cls = typeof node.className === 'string' ? node.className : '';
+      
+      const isLabel = cls.includes('modtype_label') || tagName === 'h4' || tagName === 'h5' || 
+                      (tagName !== 'a' && !node.querySelector('a[href]') && (node.innerText || '').trim().length > 3);
+                      
+      if (isLabel) {
+        const text = (node.innerText || node.textContent || '').trim().split('\\n')[0];
+        if (text && text.length > 3 && text.length < 200) {
+          current_label = text;
+          label_resource_count = 0;
+        }
         continue;
       }
 
-      const anchor=act.querySelector('a[href]')||act;
-      const href=anchor.getAttribute('href')||'';
-      if(!href||href.startsWith('javascript:')||href.startsWith('#')) continue;
+      const anchor = tagName === 'a' ? node : node.querySelector('a[href]');
+      if (!anchor) continue;
+      
+      const href = anchor.getAttribute('href') || '';
+      if (!href || href.startsWith('javascript:') || href.startsWith('#')) continue;
+      
+      const isTrap = href.includes('sesskey=') || ['/user/', '/message/', '/grade/', '/calendar/', '/report/'].some(trap => href.includes(trap));
+      if (isTrap) continue;
 
-      const blocked=cls.includes('dimmed')||cls.includes('conditionalhidden')||
-                     cls.includes('restricted');
-      const isLTI=cls.includes('modtype_lti')||cls.includes('modtype_scorm')||
-                   cls.includes('modtype_h5pactivity')||cls.includes('modtype_bigbluebuttonbn');
-
-      let link_text=(anchor.innerText||anchor.textContent||'').trim().split('\\n')[0];
-      if(!link_text) link_text=anchor.getAttribute('title')||anchor.getAttribute('aria-label')||
-                                act.getAttribute('data-activityname')||'';
-
+      let link_text = (anchor.innerText || anchor.textContent || '').trim().split('\\n')[0];
+      if (!link_text) {
+        link_text = anchor.getAttribute('title') || anchor.getAttribute('aria-label') || node.getAttribute('data-activityname') || 'recurso';
+      }
+      
       label_resource_count++;
       const effective_label = label_resource_count > MAX_LABEL_PROP ? null : current_label;
 
-      let type='link';
-      const tm=[
-        ['pluginfile','file'],['forcedownload','file'],
-        ['/mod/folder/','folder'],['/mod/page/','page'],['/mod/book/','page'],
-        ['/mod/forum/','forum'],['/mod/url/','url'],
-        ['/mod/resource/','resource'],['/mod/assign/','assign'],
-        ['/mod/quiz/','quiz'],['/mod/wiki/','wiki'],
-        ['/mod/glossary/','glossary'],['/mod/data/','database'],
-        ['/mod/workshop/','workshop'],['/mod/lesson/','lesson'],
+      let type = 'link';
+      const typeMap = [
+        ['pluginfile', 'file'], ['forcedownload', 'file'],
+        ['/mod/folder/', 'folder'], ['/mod/page/', 'page'], ['/mod/book/', 'page'],
+        ['/mod/forum/', 'forum'], ['/mod/url/', 'url'],
+        ['/mod/resource/', 'resource'], ['/mod/assign/', 'assign'],
+        ['/mod/quiz/', 'quiz'], ['/mod/wiki/', 'wiki'],
+        ['/mod/glossary/', 'glossary'], ['/mod/data/', 'database'],
+        ['/mod/workshop/', 'workshop'], ['/mod/lesson/', 'lesson']
       ];
-      for(const [p,t] of tm){ if(href.includes(p)){type=t;break;} }
+      for (const [p, t] of typeMap) {
+        if (href.includes(p)) {
+          type = t;
+          break;
+        }
+      }
 
-      const iframes=Array.from(act.querySelectorAll('iframe')).map(f=>({
-        src:f.getAttribute('src')||f.getAttribute('data-src')||f.getAttribute('data-url')||''
-      })).filter(f=>f.src&&(f.src.startsWith('http')||f.src.startsWith('//')));
+      const icon = node.querySelector('img, svg');
+      let inferred_ext = '';
+      if (icon) {
+        const src = icon.getAttribute('src') || '';
+        const alt = icon.getAttribute('alt') || '';
+        const icon_text = (src + ' ' + alt).toLowerCase();
+        if (icon_text.includes('pdf')) inferred_ext = '.pdf';
+        else if (icon_text.includes('powerpoint') || icon_text.includes('ppt') || icon_text.includes('pptx')) inferred_ext = '.pptx';
+        else if (icon_text.includes('word') || icon_text.includes('doc') || icon_text.includes('docx')) inferred_ext = '.docx';
+        else if (icon_text.includes('excel') || icon_text.includes('xls') || icon_text.includes('xlsx')) inferred_ext = '.xlsx';
+        else if (icon_text.includes('zip') || icon_text.includes('rar') || icon_text.includes('archive')) inferred_ext = '.zip';
+        else if (icon_text.includes('mp4') || icon_text.includes('video') || icon_text.includes('movie')) inferred_ext = '.mp4';
+      }
+
+      const blocked = cls.includes('dimmed') || cls.includes('restricted') || cls.includes('conditionalhidden');
+      const isLTI = cls.includes('modtype_lti') || cls.includes('modtype_scorm') || cls.includes('modtype_h5p');
+      const iframes = Array.from(node.querySelectorAll('iframe')).map(f => ({
+        src: f.getAttribute('src') || f.getAttribute('data-src') || ''
+      })).filter(f => f.src);
+
+      let item_hierarchy = [current_section];
+      if (effective_label) {
+        item_hierarchy.push(effective_label);
+      }
 
       results.push({
-        url:href, link_text:link_text.substring(0,200), name:link_text.substring(0,200),
-        section:current_section, section_idx:current_section_idx,
-        label_context:effective_label, seq:seq++,
-        type:type, blocked:blocked, lti:isLTI, iframes:iframes,
+        url: href,
+        link_text: link_text.substring(0, 200),
+        name: link_text.substring(0, 200),
+        section: current_section,
+        section_idx: current_section_idx,
+        label_context: effective_label,
+        seq: seq++,
+        type: type,
+        blocked: blocked,
+        lti: isLTI,
+        iframes: iframes,
+        hierarchy: item_hierarchy,
+        inferred_ext: inferred_ext,
+        extra_meta: {
+          breadcrumbs: breadcrumbs,
+          nearest_heading: current_section
+        }
       });
     }
   });
+
+  Array.from(document.querySelectorAll('a[href*="/course/view.php"]')).forEach(a => {
+    const href = a.getAttribute('href') || '';
+    const isSection = href.includes('section=') || href.includes('sectionid=');
+    if (isSection) {
+      let text = (a.innerText || a.textContent || '').trim();
+      if (text.length > 0 && text.length < 150) {
+        results.push({
+          url: href,
+          link_text: text,
+          name: text,
+          section: 'Navegación de Secciones',
+          section_idx: 0,
+          type: 'section_link',
+          blocked: false,
+          lti: false,
+          iframes: [],
+          hierarchy: ['Navegación de Secciones']
+        });
+      }
+    }
+  });
+
   return results;
 })();
 """
 
 
-def _setup_driver(cookies: dict) -> webdriver.Chrome:
+def auth() -> Tuple[list, str]:
+    """
+    Autenticación centralizada con Selenium.
+    Inicia un navegador temporal headless, navega al login de eGela,
+    introduce credenciales, espera a estar autenticado,
+    y extrae cookies + User-Agent.
+    """
+    log.info("🔐 Iniciando proceso de autenticación interactivo (se abrirá Chrome)...")
     opts = Options()
     for arg in [
-        "--headless=new", "--disable-gpu", "--no-sandbox",
+        "--disable-gpu", "--no-sandbox",
+        "--disable-dev-shm-usage", "--disable-extensions",
+        "--window-size=1200,900", "--disable-blink-features=AutomationControlled",
+    ]:
+        opts.add_argument(arg)
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    
+    d = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()), options=opts
+    )
+    try:
+        d.set_page_load_timeout(30)
+        d.get(f"https://{CONFIG['DOMAIN']}/login/index.php")
+        
+        WebDriverWait(d, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='username'], #username"))
+        )
+        
+        u_el = d.find_element(By.CSS_SELECTOR, "input[name='username'], #username")
+        u_el.clear()
+        u_el.send_keys(CONFIG["USERNAME"])
+        
+        log.info("🖥️  [INTERACTIVO] Por favor, introduce tu contraseña en la ventana de Chrome que se acaba de abrir y haz clic en 'Iniciar sesión'.")
+        
+        # Esperar hasta 120 segundos a que el usuario complete el login
+        WebDriverWait(d, 120).until(
+            lambda driver: "login" not in driver.current_url.lower() or
+                           driver.find_elements(By.CSS_SELECTOR, ".userpicture, #action-menu-toggle-1")
+        )
+        
+        raw_cookies = d.get_cookies()
+        cookies = [c for c in raw_cookies if c["name"] in ("MoodleSessionegela", "MOODLEID1_egela")]
+        ua = d.execute_script("return navigator.userAgent")
+        log.info("🔑 Autenticación exitosa. Se extrajeron %d cookies íntegras de sesión.", len(cookies))
+        return cookies, ua
+    except Exception as e:
+        log.error("❌ Error de autenticación: %s", e)
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            d.quit()
+
+
+def build_session(cookies: list, ua: str) -> requests.Session:
+    """
+    Crea una sesión requests con cookies y User-Agent preconfigurados.
+    Añade reintentos robustos ante microcortes (TransientError).
+    """
+    session = requests.Session()
+    session.headers.update({"User-Agent": ua})
+    if isinstance(cookies, dict):
+        session.cookies.update(cookies)
+    else:
+        for c in cookies:
+            session.cookies.set(c["name"], c["value"], domain=c.get("domain", CONFIG["DOMAIN"]))
+    
+    retries = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def _setup_driver(cookies: list, ua: str) -> webdriver.Chrome:
+    opts = Options()
+    
+    # ¡ESTA LÍNEA ES LA MAGIA QUE ENGAÑA A MOODLE!
+    opts.add_argument(f"user-agent={ua}")
+    
+    args_list = [
+        "--disable-gpu", "--no-sandbox",
         "--disable-dev-shm-usage", "--disable-extensions",
         "--window-size=1920,1080", "--disable-blink-features=AutomationControlled",
-    ]:
+    ]
+    if not CONFIG.get("AGENT_MODE", False):
+        args_list.append("--headless=new")
+        
+    for arg in args_list:
         opts.add_argument(arg)
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
@@ -2658,9 +3241,24 @@ def _setup_driver(cookies: dict) -> webdriver.Chrome:
         {"source": _BLOB_INTERCEPTOR_JS}
     )
     d.get(f"https://{CONFIG['DOMAIN']}")
-    for k, v in cookies.items():
-        with contextlib.suppress(Exception):
-            d.add_cookie({"name": k, "value": v, "domain": CONFIG["DOMAIN"]})
+    try:
+        d.delete_all_cookies()
+    except Exception:
+        pass
+    if isinstance(cookies, dict):
+        for k, v in cookies.items():
+            with contextlib.suppress(Exception):
+                d.add_cookie({"name": k, "value": v, "domain": CONFIG["DOMAIN"], "path": "/"})
+    else:
+        for c in cookies:
+            try:
+                c["domain"] = CONFIG["DOMAIN"]
+                c["path"] = "/"
+                if "expiry" in c:
+                    del c["expiry"]
+                d.add_cookie(c)
+            except Exception as e:
+                log.error("❌ Fallo al inyectar cookie %s: %s", c.get("name"), e)
     return d
 
 
@@ -2670,6 +3268,53 @@ def _is_driver_alive(d: webdriver.Chrome) -> bool:
         return True
     except Exception:
         return False
+
+
+def classify_page_context(d: webdriver.Chrome) -> dict:
+    url = d.current_url
+    title = d.title or ""
+    
+    # Breadcrumbs extraction
+    try:
+        bc_elements = d.find_elements(By.CSS_SELECTOR, '.breadcrumb-item, .breadcrumb a, .breadcrumbs a')
+        breadcrumbs = [el.text.strip() for el in bc_elements if el.text.strip()]
+    except Exception:
+        breadcrumbs = []
+        
+    page_type = "external_url"
+    if CONFIG["DOMAIN"] in url:
+        if "/course/view.php" in url:
+            page_type = "course_home"
+        elif "/mod/folder/" in url:
+            page_type = "folder_view"
+        elif "/mod/page/" in url:
+            page_type = "page_view"
+        elif "/mod/book/" in url:
+            page_type = "book_view"
+        elif "/mod/assign/" in url:
+            page_type = "assign_view"
+        elif "/mod/forum/" in url:
+            page_type = "forum_view"
+        else:
+            page_type = "generic_moodle_page"
+            
+    # Try to extract the main heading as page title if title is generic
+    main_heading = ""
+    try:
+        headings = d.find_elements(By.CSS_SELECTOR, 'h1, h2, h3')
+        for h in headings:
+            if h.is_displayed() and h.text.strip():
+                main_heading = h.text.strip()
+                break
+    except Exception:
+        pass
+        
+    return {
+        "page_type": page_type,
+        "title": main_heading or title,
+        "url": url,
+        "breadcrumbs": breadcrumbs
+    }
 
 
 def _navigate_page(
@@ -2740,7 +3385,8 @@ def spider(
     ro_conn = _open_db_ro(db_path)
     visited = BoundedVisitedSet(maxsize=CONFIG["VISITED_LRU_MAXSIZE"], db_path=db_path)
 
-    d             = _setup_driver(cookies)
+    d             = _setup_driver(cookies, ua)
+    debugger      = AgentDebugger(d)
     pages_loaded  = 0
     driver_born   = time.monotonic()
     last_activity = time.monotonic()
@@ -2754,12 +3400,13 @@ def spider(
                 time.monotonic() - driver_born > CONFIG["MAX_SECS_PER_DRIVER"])
 
     def _restart_driver():
-        nonlocal d, pages_loaded, driver_born, last_activity
+        nonlocal d, debugger, pages_loaded, driver_born, last_activity
         log.info("♻️  Reiniciando Chrome (páginas=%d, tiempo=%.0fs)...",
                  pages_loaded, time.monotonic() - driver_born)
         with contextlib.suppress(Exception):
             d.quit()
-        d             = _setup_driver(cookies)
+        d             = _setup_driver(cookies, ua)
+        debugger      = AgentDebugger(d)
         pages_loaded  = 0
         driver_born   = time.monotonic()
         last_activity = time.monotonic()
@@ -2775,27 +3422,27 @@ def spider(
                      time.monotonic() - last_activity)
             _restart_driver()
 
-    def crawl(url: str, cid: str, depth: int = 0):
+    def crawl(url: str, cid: str, depth: int = 0, current_tree: Optional['CourseTree'] = None) -> Optional['CourseTree']:
         nonlocal pages_loaded, last_activity
 
         if depth > 10:
             _dlq("manual",
                  "Límite de profundidad (depth=10). Posibles recursos no descargados.",
                  url, cid, f"Accede manualmente: {url}")
-            return
+            return current_tree
 
         if _is_nav_trap(url):
-            return
+            return current_tree
 
         norm = normalize_url(url)
         if norm in visited:
-            return
+            return current_tree
         rows = execute_read_safe(ro_conn, "SELECT status FROM visited WHERE url=?", (norm,))
         if rows:
             status = rows[0][0]
             if status in ("completed", "failed", "manual"):
                 visited.add(norm)
-                return
+                return current_tree
 
         # Registrar estado de procesamiento inicial
         safe_put(dbq, {"type": "VISITED", "url": norm, "status": "processing", "cid": cid})
@@ -2805,12 +3452,36 @@ def spider(
         _ensure_driver()
 
         full_load = any(m in url for m in CONFIG["FULL_LOAD_MODULES"])
-        if not _navigate_page(d, url, full_load=full_load):
-            _dlq("recoverable", "No se pudo cargar la página.",
-                 url, cid, f"Accede manualmente: {url}")
-            safe_put(dbq, {"type": "VISITED", "url": norm, "status": "failed", "cid": cid})
-            return
-
+        while True:
+            try:
+                if not _navigate_page(d, url, full_load=full_load):
+                    if CONFIG.get("AGENT_MODE", False):
+                        debugger.alert_and_wait("No se pudo cargar la página.", f"Navegar a {url}")
+                        continue
+                    else:
+                        _dlq("recoverable", "No se pudo cargar la página.",
+                             url, cid, f"Accede manualmente: {url}")
+                        safe_put(dbq, {"type": "VISITED", "url": norm, "status": "failed", "cid": cid})
+                        return current_tree
+                
+                # DETECTOR DE EXPULSIÓN DE MOODLE
+                is_homepage = d.current_url.strip("/").replace("https://", "").replace("http://", "") == CONFIG["DOMAIN"].strip("/")
+                if "login" in d.current_url or d.find_elements(By.ID, "username") or is_homepage:
+                    if CONFIG.get("AGENT_MODE", False):
+                        debugger.alert_and_wait("Moodle ha expulsado a la araña o pide login.", f"Verificar sesión en {url}")
+                        continue
+                    else:
+                        log.error("❌ Moodle ha expulsado a la araña. URL actual: %s", d.current_url)
+                        _dlq("critical", "Moodle rechazó las cookies por cambio de navegador.", url, cid, "Revisa la sesión.")
+                        return current_tree
+                break
+            except Exception as e:
+                if CONFIG.get("AGENT_MODE", False):
+                    debugger.alert_and_wait(f"Excepción al navegar: {e}", f"Navegar a {url}")
+                    continue
+                else:
+                    raise
+        
         last_activity = time.monotonic()
         page_title    = d.title or ""
 
@@ -2819,24 +3490,95 @@ def spider(
             _dlq("manual", "Redirección a dominio externo.", url, cid,
                  "Accede manualmente con sesión institucional.")
             safe_put(dbq, {"type": "VISITED", "url": norm, "status": "manual", "cid": cid})
-            return
+            return current_tree
+
+        # ── CLASIFICACIÓN DE CONTEXTO Y DIAGNÓSTICOS ─────────────────────────
+        page_ctx = classify_page_context(d)
+        page_type = page_ctx["page_type"]
+        page_title = page_ctx["title"] or page_title
+        debugger.dump_diagnostics(cid, page_type)
+
+        if current_tree is None:
+            current_tree = CourseTree(page_title or f"Curso_{cid}", cid)
+        elif current_tree.root["name"] == f"Curso_{cid}" and page_title:
+            current_tree.root["name"] = page_title
+        # ─────────────────────────────────────────────────────────────────────
 
         pages_loaded += 1
 
-        try:
-            elementos = d.execute_script(_JS_MAP_UNIVERSAL) or []
-        except Exception as e:
-            _dlq("critical",
-                 f"Analizador DOM falló. Recursos NO descargados. Título: {page_title}",
-                 url, cid, f"Abre en Moodle: {url}")
-            safe_put(dbq, {"type": "VISITED", "url": norm, "status": "failed", "cid": cid})
-            return
+        time.sleep(1.0)
+
+        while True:
+            try:
+                elementos = d.execute_script("return " + _JS_MAP_UNIVERSAL) or []
+                log.info("🕷️  Extracción en %s exitosa. Elementos encontrados: %d", url, len(elementos))
+                break
+            except Exception as e:
+                if CONFIG.get("AGENT_MODE", False):
+                    debugger.alert_and_wait(f"Excepción al extraer DOM: {e}", f"Extraer elementos de {url}")
+                    continue
+                else:
+                    _dlq("critical",
+                         f"Analizador DOM falló. Recursos NO descargados. Título: {page_title}",
+                         url, cid, f"Abre en Moodle: {url}")
+                    safe_put(dbq, {"type": "VISITED", "url": norm, "status": "failed", "cid": cid})
+                    return current_tree
+
+        # Modo Interactivo de Aprobación
+        if depth == 0 and CONFIG.get("AGENT_MODE", False):
+            while True:
+                files_count = sum(1 for el in elementos if el.get("type") in ("file", "resource") or _is_direct_download(el.get("url", "")))
+                folders_count = sum(1 for el in elementos if el.get("type") == "folder")
+                pages_count = sum(1 for el in elementos if el.get("type") in ("page", "book"))
+                assigns_count = sum(1 for el in elementos if el.get("type") == "assign")
+                forums_count = sum(1 for el in elementos if el.get("type") == "forum")
+                others_count = len(elementos) - files_count - folders_count - pages_count - assigns_count - forums_count
+                
+                print("\n" + "=" * 80)
+                print(f"📋 RESUMEN DE PARSEO PARA EL CURSO: ID {cid} - \"{page_title}\"")
+                print("-" * 80)
+                print(f"   📂 Carpetas (Folders):         {folders_count}")
+                print(f"   📄 Páginas / Libros:           {pages_count}")
+                print(f"   📥 Archivos (PDFs/Docx/etc):   {files_count}")
+                print(f"   📝 Tareas (Assignments):       {assigns_count}")
+                print(f"   💬 Foros (Forums):             {forums_count}")
+                print(f"   🔗 Otros (LTI/Wikis/etc):      {others_count}")
+                print(f"   📌 Total de recursos:          {len(elementos)}")
+                print("=" * 80 + "\n")
+                
+                res = input("🤖 ¿Confirmas que el parseo es correcto para proceder a la descarga masiva? (S/N) [S]: ").strip().lower()
+                if res in ("", "s", "si", "y", "yes"):
+                    log.info("✅ Confirmación recibida. Procediendo con el procesamiento...")
+                    break
+                elif res in ("n", "no"):
+                    log.warning("❌ Aprobación rechazada por el usuario.")
+                    opt = input("⚠️ ¿Qué deseas hacer? (R: Reintentar parseo, S: Saltar este curso, D: Lanzar debugger y pausar) [R]: ").strip().lower()
+                    if opt == "s":
+                        log.info(f"⏭️ Saltando el curso {cid} por decisión del usuario.")
+                        safe_put(dbq, {"type": "VISITED", "url": norm, "status": "manual", "cid": cid})
+                        return current_tree
+                    elif opt == "d":
+                        debugger.alert_and_wait("El usuario rechazó el parseo de elementos.", "Aprobación de parseo de curso")
+                        try:
+                            elementos = d.execute_script("return " + _JS_MAP_UNIVERSAL) or []
+                            page_title = d.title or ""
+                        except Exception as e:
+                            log.error(f"Error al volver a parsear: {e}")
+                    else:
+                        # Reintentar parseo por defecto
+                        try:
+                            elementos = d.execute_script("return " + _JS_MAP_UNIVERSAL) or []
+                            page_title = d.title or ""
+                        except Exception as e:
+                            log.error(f"Error al volver a parsear: {e}")
+                else:
+                    print("Opción no reconocida. Por favor ingresa S, N o presiona ENTER.")
 
         c_dir = ensure(os.path.join(CONFIG["ROOT_DIR"], f"Curso_{cid}"))
 
         for el in elementos:
             if stop_workers.is_set():
-                return
+                return current_tree
 
             u         = el.get("url", "")
             link_txt  = el.get("link_text", "") or el.get("name", "")
@@ -2848,6 +3590,7 @@ def spider(
             blocked   = el.get("blocked", False)
             is_lti    = el.get("lti", False)
             iframes   = el.get("iframes", [])
+            hierarchy = el.get("hierarchy", [])
 
             if not u:
                 continue
@@ -2863,9 +3606,18 @@ def spider(
                 if section and section != "00_General"
                 else "99_Sin_Contexto"
             )
-            target_dir = os.path.join(c_dir, sec_folder)
-            if label_ctx:
-                target_dir = os.path.join(target_dir, _s(label_ctx[:40]))
+
+            # Construcción dinámica de directorios basados en jerarquía semántica
+            if hierarchy:
+                cleaned_segments = []
+                for i, segment in enumerate(hierarchy):
+                    if i == 0 and section and segment == section:
+                        cleaned_segments.append(sec_folder)
+                    else:
+                        cleaned_segments.append(_s(segment[:40]))
+                target_dir = os.path.join(c_dir, *cleaned_segments)
+            else:
+                target_dir = os.path.join(c_dir, "99_Sin_Contexto")
 
             job_template = {
                 "cid":           cid,
@@ -2876,6 +3628,7 @@ def spider(
                 "page_origin":   url,
                 "link_text":     link_txt,
                 "name":          link_txt,
+                "hierarchy":     hierarchy,
             }
 
             for i_idx, i_data in enumerate(iframes):
@@ -2883,6 +3636,8 @@ def spider(
                 if not src:
                     continue
                 if _is_external_save_domain(src):
+                    if current_tree:
+                        current_tree.add_node(hierarchy, f"{link_txt}_iframe{i_idx + 1}", "iframe", url=src)
                     save_url_reference(
                         ensure(target_dir), seq, f"{link_txt}_iframe{i_idx + 1}",
                         src, url, "iframe", "Contenido embebido en iframe",
@@ -2891,9 +3646,11 @@ def spider(
                 elif CONFIG["DOMAIN"] in src:
                     norm_iframe = normalize_url(src)
                     if norm_iframe not in visited:
-                        crawl(src, cid, depth + 1)
+                        crawl(src, cid, depth + 1, current_tree=current_tree)
 
             if blocked:
+                if current_tree:
+                    current_tree.add_node(hierarchy, link_txt, "blocked", url=u)
                 _dlq("manual", f"Recurso bloqueado: {link_txt}", u, cid,
                      "Comprueba requisitos de acceso en Moodle.")
                 save_url_reference(
@@ -2904,6 +3661,8 @@ def spider(
                 continue
 
             if is_lti:
+                if current_tree:
+                    current_tree.add_node(hierarchy, link_txt, "lti", url=u)
                 save_url_reference(
                     ensure(target_dir), seq, link_txt, u, url, "lti",
                     "Herramienta LTI/SCORM/Interactiva no descargable automáticamente",
@@ -2915,86 +3674,181 @@ def spider(
                 continue
 
             if etype in ("file", "resource") or _is_direct_download(u):
+                if current_tree:
+                    current_tree.add_node(hierarchy, link_txt, "file", url=u)
                 job = {**job_template, "url": u, "target": ensure(target_dir),
                        "resource_type": "file"}
                 _enqueue_download(dq, semaphore, job, stop_workers, active_downloads_count)
 
             elif etype == "url":
                 rewritten = _rewrite_cloud_url(u)
-                save_url_reference(
-                    ensure(target_dir), seq, link_txt, u, url,
-                    "external_url", "Enlace externo de Moodle",
-                    ctx_section=section, ctx_label=label_ctx or "",
-                    extra={"rewritten_url": rewritten},
-                )
-                if rewritten != u:
-                    job = {**job_template, "url": rewritten,
-                           "target": ensure(target_dir), "resource_type": "external"}
-                    _enqueue_download(dq, semaphore, job, stop_workers, active_downloads_count)
+                if current_tree:
+                    current_tree.add_node(hierarchy, link_txt, "url", url=rewritten)
+                job = {**job_template, "url": rewritten,
+                       "target": ensure(target_dir), "resource_type": "external"}
+                _enqueue_download(dq, semaphore, job, stop_workers, active_downloads_count)
 
             elif etype == "folder":
                 norm_child = normalize_url(u)
                 if norm_child not in visited and CONFIG["DOMAIN"] in u:
                     visited.add(norm_child)
-                    if _navigate_page(d, u):
-                        last_activity = time.monotonic()
-                        extract_folder_pages(
-                            d, u, ensure(target_dir), link_txt, seq,
-                            semaphore, dq, job_template, visited, dbq, stop_workers,
-                            active_downloads_count
-                        )
-                        with contextlib.suppress(Exception):
-                            d.back()
-                            time.sleep(0.5)
+                    if current_tree:
+                        current_tree.add_node(hierarchy, link_txt, "folder", url=u)
+                    nested_target_dir = os.path.join(target_dir, _s(link_txt[:40]))
+                    while True:
+                        try:
+                            if not _navigate_page(d, u):
+                                if CONFIG.get("AGENT_MODE", False):
+                                    debugger.alert_and_wait("No se pudo cargar la carpeta.", f"Navegar a carpeta {link_txt}")
+                                    continue
+                                else:
+                                    break
+                            
+                            last_activity = time.monotonic()
+                            extract_folder_pages(
+                                d, u, ensure(nested_target_dir), link_txt, seq,
+                                semaphore, dq, job_template, visited, dbq, stop_workers,
+                                active_downloads_count, debugger=debugger,
+                                current_tree=current_tree, parent_path=hierarchy + [link_txt]
+                            )
+                            break
+                        except Exception as e:
+                            if CONFIG.get("AGENT_MODE", False):
+                                debugger.alert_and_wait(f"Error procesando carpeta: {e}", f"Procesar carpeta {link_txt}")
+                                continue
+                            else:
+                                break
+                    with contextlib.suppress(Exception):
+                        d.back()
+                        time.sleep(0.5)
 
-            elif etype == "page":
+            elif etype in ("page", "book"):
                 norm_child = normalize_url(u)
                 if norm_child not in visited and CONFIG["DOMAIN"] in u:
                     visited.add(norm_child)
-                    if _navigate_page(d, u, full_load=True):
-                        last_activity = time.monotonic()
-                        extract_page_content(
-                            d, u, ensure(target_dir), link_txt, seq,
-                            dbq, visited, job_template, semaphore, dq, stop_workers,
-                            active_downloads_count
-                        )
-                        crawl(u, cid, depth + 1)
-                        with contextlib.suppress(Exception):
-                            d.back()
-                            time.sleep(0.5)
+                    if current_tree:
+                        current_tree.add_node(hierarchy, link_txt, etype, url=u)
+                    nested_target_dir = os.path.join(target_dir, _s(link_txt[:40]))
+                    while True:
+                        try:
+                            if not _navigate_page(d, u, full_load=True):
+                                if CONFIG.get("AGENT_MODE", False):
+                                    debugger.alert_and_wait(f"No se pudo cargar {etype}.", f"Navegar a {etype} {link_txt}")
+                                    continue
+                                else:
+                                    break
+                            
+                            last_activity = time.monotonic()
+                            if etype == "page":
+                                extract_page_content(
+                                    d, u, ensure(nested_target_dir), link_txt, seq,
+                                    dbq, visited, job_template, semaphore, dq, stop_workers,
+                                    active_downloads_count, debugger=debugger,
+                                    current_tree=current_tree, parent_path=hierarchy + [link_txt]
+                                )
+                            else:
+                                extract_book_content(
+                                    d, u, ensure(target_dir), link_txt, seq,
+                                    semaphore, dq, job_template, visited, dbq, stop_workers,
+                                    active_downloads_count, debugger=debugger,
+                                    current_tree=current_tree, parent_path=hierarchy + [link_txt]
+                                )
+                            crawl(u, cid, depth + 1, current_tree=current_tree)
+                            break
+                        except Exception as e:
+                            if CONFIG.get("AGENT_MODE", False):
+                                debugger.alert_and_wait(f"Error procesando {etype}: {e}", f"Procesar {etype} {link_txt}")
+                                continue
+                            else:
+                                break
+                    with contextlib.suppress(Exception):
+                        d.back()
+                        time.sleep(0.5)
 
             elif etype == "assign":
                 norm_child = normalize_url(u)
                 if norm_child not in visited and CONFIG["DOMAIN"] in u:
                     visited.add(norm_child)
-                    if _navigate_page(d, u, full_load=True):
-                        last_activity = time.monotonic()
-                        extract_assign_content(
-                            d, u, ensure(target_dir), link_txt, seq,
-                            semaphore, dq, job_template, dbq, stop_workers,
-                            active_downloads_count
-                        )
-                        with contextlib.suppress(Exception):
-                            d.back()
-                            time.sleep(0.5)
+                    if current_tree:
+                        current_tree.add_node(hierarchy, link_txt, "assign", url=u)
+                    nested_target_dir = os.path.join(target_dir, _s(link_txt[:40]))
+                    while True:
+                        try:
+                            if not _navigate_page(d, u, full_load=True):
+                                if CONFIG.get("AGENT_MODE", False):
+                                    debugger.alert_and_wait("No se pudo cargar la tarea.", f"Navegar a tarea {link_txt}")
+                                    continue
+                                else:
+                                    break
+                            
+                            last_activity = time.monotonic()
+                            extract_assign_content(
+                                d, u, ensure(nested_target_dir), link_txt, seq,
+                                semaphore, dq, job_template, dbq, stop_workers,
+                                active_downloads_count, debugger=debugger,
+                                current_tree=current_tree, parent_path=hierarchy + [link_txt]
+                            )
+                            break
+                        except Exception as e:
+                            if CONFIG.get("AGENT_MODE", False):
+                                debugger.alert_and_wait(f"Error procesando tarea: {e}", f"Procesar tarea {link_txt}")
+                                continue
+                            else:
+                                break
+                    with contextlib.suppress(Exception):
+                        d.back()
+                        time.sleep(0.5)
+
+            elif etype == "section_link":
+                norm_child = normalize_url(u)
+                if norm_child not in visited and CONFIG["DOMAIN"] in u:
+                    try:
+                        url_params = parse_qs(urlparse(u).query)
+                        url_cid = url_params.get("id", [None])[0]
+                        if url_cid and str(url_cid) == str(cid):
+                            visited.add(norm_child)
+                            crawl(u, cid, depth + 1, current_tree=current_tree)
+                    except Exception:
+                        pass
 
             elif etype == "forum":
                 norm_child = normalize_url(u)
                 if norm_child not in visited and CONFIG["DOMAIN"] in u:
                     visited.add(norm_child)
-                    if _navigate_page(d, u, full_load=True):
-                        last_activity = time.monotonic()
-                        extract_forum_attachments(
-                            d, u, ensure(target_dir), link_txt, seq,
-                            semaphore, dq, job_template, visited, dbq, stop_workers,
-                            active_downloads_count
-                        )
-                        with contextlib.suppress(Exception):
-                            d.back()
-                            time.sleep(0.5)
+                    if current_tree:
+                        current_tree.add_node(hierarchy, link_txt, "forum", url=u)
+                    nested_target_dir = os.path.join(target_dir, _s(link_txt[:40]))
+                    while True:
+                        try:
+                            if not _navigate_page(d, u, full_load=True):
+                                if CONFIG.get("AGENT_MODE", False):
+                                    debugger.alert_and_wait("No se pudo cargar el foro.", f"Navegar a foro {link_txt}")
+                                    continue
+                                else:
+                                    break
+                            
+                            last_activity = time.monotonic()
+                            extract_forum_attachments(
+                                d, u, ensure(nested_target_dir), link_txt, seq,
+                                semaphore, dq, job_template, visited, dbq, stop_workers,
+                                active_downloads_count, debugger=debugger,
+                                current_tree=current_tree, parent_path=hierarchy + [link_txt]
+                            )
+                            break
+                        except Exception as e:
+                            if CONFIG.get("AGENT_MODE", False):
+                                debugger.alert_and_wait(f"Error procesando foro: {e}", f"Procesar foro {link_txt}")
+                                continue
+                            else:
+                                break
+                    with contextlib.suppress(Exception):
+                        d.back()
+                        time.sleep(0.5)
 
             elif etype in ("quiz", "wiki", "glossary", "database",
                            "workshop", "lesson"):
+                if current_tree:
+                    current_tree.add_node(hierarchy, link_txt, etype, url=u)
                 save_url_reference(
                     ensure(target_dir), seq, link_txt, u, url, etype,
                     f"Actividad interactiva Moodle ({etype})",
@@ -3002,14 +3856,16 @@ def spider(
                 )
                 norm_child = normalize_url(u)
                 if norm_child not in visited and f"id={cid}" in u:
-                    crawl(u, cid, depth + 1)
+                    crawl(u, cid, depth + 1, current_tree=current_tree)
 
             elif CONFIG["DOMAIN"] in u:
                 norm_child = normalize_url(u)
                 if norm_child not in visited:
-                    crawl(u, cid, depth + 1)
+                    crawl(u, cid, depth + 1, current_tree=current_tree)
 
             else:
+                if current_tree:
+                    current_tree.add_node(hierarchy, link_txt, "unknown", url=u)
                 save_url_reference(
                     ensure(target_dir), seq, link_txt, u, url, "unknown",
                     "Tipo de recurso no identificado",
@@ -3023,6 +3879,7 @@ def spider(
         # Completado con éxito
         visited.add(norm)
         safe_put(dbq, {"type": "VISITED", "url": norm, "status": "completed", "cid": cid})
+        return current_tree
 
     try:
         while not stop_workers.is_set():
@@ -3037,7 +3894,10 @@ def spider(
             _current_task["task"] = task
             log.info("🕷️  Curso %s → %s", task.get("cid"), task.get("url"))
             try:
-                crawl(task["url"], task["cid"])
+                tree = crawl(task["url"], task["cid"])
+                if tree:
+                    c_dir = ensure(os.path.join(CONFIG["ROOT_DIR"], f"Curso_{task['cid']}"))
+                    tree.save_to_files(c_dir)
             except Exception as e:
                 safe_put(dbq, {
                     "type": "DLQ", "severity": "critical",
@@ -3451,6 +4311,15 @@ def _graceful_shutdown(
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="eGela Crawler Agentic Edition")
+    parser.add_argument("--agent", action="store_true", help="Activar el modo interactivo del Agente (Human-in-the-Loop)")
+    args = parser.parse_known_args()[0]
+    
+    if args.agent:
+        CONFIG["AGENT_MODE"] = True
+        log.info("🤖 MODO AGENTE CON HUMAN-IN-THE-LOOP ACTIVADO.")
+
     # spawn: comportamiento coherente con Selenium y SQLite en macOS/Windows
     try:
         mp.set_start_method("spawn", force=True)
@@ -3529,15 +4398,17 @@ def main():
     )
     dbp.start()
 
-    spiders = [
-        mp.Process(
-            target=spider,
-            args=(spider_q, dl_q, db_q, stop_workers,
-                  cookies, ua, db_path, semaphore, active_downloads_count),
-            name=f"Spider-{i + 1}"
-        )
-        for i in range(CONFIG["SPIDERS"])
-    ]
+    spiders = []
+    if not CONFIG.get("AGENT_MODE", False):
+        spiders = [
+            mp.Process(
+                target=spider,
+                args=(spider_q, dl_q, db_q, stop_workers,
+                      cookies, ua, db_path, semaphore, active_downloads_count),
+                name=f"Spider-{i + 1}"
+            )
+            for i in range(CONFIG["SPIDERS"])
+        ]
 
     downs = [
         mp.Process(
@@ -3563,41 +4434,50 @@ def main():
     signal.signal(signal.SIGINT,  shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Esperar spiders con timeout seguro
-    _join_with_timeout(spiders)
+    # === NUEVA LÓGICA DE ESPERA (REEMPLAZAR DESDE AQUÍ) ===
+    
+    if CONFIG.get("AGENT_MODE", False):
+        # Enviar señal de fin a la araña
+        spider_q.put(_STOP_SENTINEL)
+        
+        # Ejecutar spider en el proceso principal
+        log.info("🤖 Ejecutando Spider en el proceso principal (Modo Agente)...")
+        spider(spider_q, dl_q, db_q, stop_workers,
+               cookies, ua, db_path, semaphore, active_downloads_count)
+    else:
+        # 1. Enviar señal de fin a las arañas (una por cada proceso spider)
+        for _ in range(CONFIG["SPIDERS"]):
+            spider_q.put(_STOP_SENTINEL)
 
-    # Esperar descargas activas antes de enviar sentinels
-    log.info("Spiders finalizados. Esperando descargas activas (%d en curso/cola)...", active_downloads_count.value)
+        # 2. Esperar a que las arañas terminen de leer TODOS los cursos sin límite de tiempo
+        log.info("🕷️ Arañas desplegadas. Explorando eGela (esto puede tardar unos minutos)...")
+        for p in spiders:
+            p.join() 
+
+    # 3. Esperar a que los downloaders terminen todas las descargas
+    log.info("✅ Spiders finalizados. Esperando descargas activas (%d en curso/cola)...", active_downloads_count.value)
     t0 = time.monotonic()
     while active_downloads_count.value > 0 and not stop_workers.is_set():
-        time.sleep(0.2)
+        time.sleep(1.0)
         if time.monotonic() - t0 > 1800:  # 30 minutos límite
             log.warning("Timeout superado esperando a que terminen las descargas.")
             break
 
-    log.info("Descargas finalizadas. Enviando sentinels a downloaders...")
-    # Shutdown ordenado con sentinels
+    log.info("✅ Descargas finalizadas. Apagando downloaders...")
     for _ in range(CONFIG["DOWNLOADERS"]):
         dl_q.put(_STOP_SENTINEL)
 
-    # Esperar a los downloaders
-    _join_with_timeout(downs)
-    
-    log.info("Downloaders finalizados. Drenando DB...")
-    
-    # Sentinel para DB daemon
+    for p in downs:
+        p.join()
+        
+    log.info("✅ Downloaders finalizados. Guardando base de datos...")
     db_q.put(_STOP_SENTINEL)
     
     stop_workers.set()
     stop_db.set()
     dbp.join(timeout=60)
     
-    if dbp.is_alive():
-        log.warning("DB daemon no cerró a tiempo — SIGTERM")
-        dbp.terminate()
-        dbp.join(timeout=10)
-
-    log.info("📊 Generando índices y partes de incidencias...")
+    # === HASTA AQUÍ ===
     for cid in courses:
         c_dir = os.path.join(CONFIG["ROOT_DIR"], f"Curso_{cid}")
         if os.path.isdir(c_dir):
@@ -3608,7 +4488,7 @@ def main():
     _check_emergency_files()
 
     print("=" * 60)
-    print("🏆 GOLDEN MASTER v12 — ZERO DATA LOSS — SELLADO.")
+    print("[*] GOLDEN MASTER v12 — ZERO DATA LOSS — SELLADO.")
     print(f"   Archivos: {CONFIG['ROOT_DIR']}/")
     print(f"   Estado:   {db_path}")
     print("=" * 60)
