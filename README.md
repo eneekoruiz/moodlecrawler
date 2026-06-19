@@ -60,6 +60,10 @@ Downloaded content is written to `EGELA_ENTERPRISE_TIMECAPSULE` by default.
 
 GitHub social preview asset: `docs/images/social-preview.png`
 
+## Architecture
+
+The CLI reads configuration, authenticates against Moodle or eGela, and passes HTTP responses to course and resource parsers. Downloaded resources then move through a filesystem organizer, keeping authentication, parsing and local naming rules independent.
+
 ## Documentation
 
 - DeepWiki: https://deepwiki.com/eneekoruiz/moodlecrawler
