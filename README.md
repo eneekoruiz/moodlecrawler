@@ -1,69 +1,40 @@
-# moodlecrawler
+# MoodleCrawler
 
-Python script for downloading and organizing course material from eGela, the UPV/EHU Moodle platform.
+Command-line tool for downloading and incrementally organizing academic course material from eGela (UPV/EHU Moodle platform).
 
-The script logs in with user-provided credentials, reads a list of course URLs, and saves resources locally while keeping the course structure readable. It is intended for personal backups of your own material.
+## Tech Stack
 
-## What it does
+- **Language:** Python 3.10+
+- **Automation & Scraping:** Selenium WebDriver, ChromeDriver / Chromium
+- **State & Storage:** SQLite
 
-- reads course URLs from `cursos.txt`
-- uses Selenium for pages that need browser interaction
-- downloads resources with `requests`
-- keeps track of processed files with SQLite
-- writes local indexes for easier offline browsing
+## Architecture & Key Decisions
 
-## Requirements
+- **Automated SSO Authentication:** Handles university LDAP / CAS single sign-on flows through headless Selenium with environment credentials.
+- **Incremental Synchronization:** Computes SHA-256 hashes of discovered documents and compares against local SQLite index to skip unchanged slides, assignments, and PDFs.
+- **Clean Folder Hierarchy:** Maps eGela course categories and sections directly to clean, sanitized local directory trees.
 
-- Python 3.12+
-- Google Chrome
-- access to the eGela account that owns the courses
+## Local Setup
 
-Install the Python dependencies:
+### Prerequisites
 
-```bash
-pip install requests selenium webdriver-manager
-```
+- Python 3.10+
+- Google Chrome or Chromium installed
 
-## Configuration
-
-Set your credentials as environment variables. Do not commit them.
-
-PowerShell:
-
-```powershell
-$env:EGELA_USER="your-user"
-$env:EGELA_PASS="your-password"
-```
-
-Then create `cursos.txt` with one course URL per line:
-
-```text
-https://egela.ehu.eus/course/view.php?id=12345
-https://egela.ehu.eus/course/view.php?id=67890
-```
-
-## Usage
+### Installation & Execution
 
 ```bash
-python crawler.py
+git clone https://github.com/eneekoruiz/moodlecrawler.git
+cd moodlecrawler
+
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# Set university credentials via environment variables
+export EGELA_USER="your-ldap-user"
+export EGELA_PASS="your-ldap-password"
+
+# Run crawler
+python legacy_crawlers/refactored_crawler.py
 ```
-
-Downloaded content is written to `EGELA_ENTERPRISE_TIMECAPSULE` by default.
-
-## Notes
-
-- Some Moodle resources need a real browser session, so the script uses Selenium in headless mode.
-- Failed or manually reviewed resources are logged in the generated course output.
-- Use it responsibly and avoid unnecessary load on university servers.
-
-## Social preview
-
-GitHub social preview asset: `docs/images/social-preview.png`
-
-## Architecture
-
-The CLI reads configuration, authenticates against Moodle or eGela, and passes HTTP responses to course and resource parsers. Downloaded resources then move through a filesystem organizer, keeping authentication, parsing and local naming rules independent.
-
-## Documentation
-
-- DeepWiki: https://deepwiki.com/eneekoruiz/moodlecrawler
